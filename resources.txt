@@ -1,0 +1,17 @@
+forceps/
+├── app/
+│   ├── main.py
+│   ├── modules/
+│   │   ├── embeddings.py
+│   │   ├── llm_ollama.py
+│   │   └── utils.py
+│   ├── requirements.txt
+│   └── demo_images/
+│       ├── demo1.jpg
+│       ├── demo2.png
+│       └── demo3.jpg
+├── build.py
+├── install.sh
+├── Dockerfile
+├── README.md
+└── .gitignore
