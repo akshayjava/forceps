@@ -794,98 +794,75 @@ def _index_stats(idx):
         pass
     return stats
 
-# Start two-phase indexing
+# Start two-phase indexing (reverted to stable behavior)
 if start_btn:
-    st.session_state.index_start_time = time.time()
-    st.session_state.phase1_duration = None
-    st.session_state.phase2_duration = None
-    st.session_state.total_index_duration = None
-    # Initialize fresh partial (flat) indices for live search during indexing
-    try:
-        st.session_state.faiss_partial = faiss.IndexIDMap2(faiss.IndexFlatL2(COMBINED_DIM))
-        if clip_dim > 0:
-            st.session_state.faiss_clip_partial = faiss.IndexIDMap2(faiss.IndexFlatL2(clip_dim))
-        else:
-            st.session_state.faiss_clip_partial = None
-    except Exception:
-        st.session_state.faiss_partial = None
-        st.session_state.faiss_clip_partial = None
-    image_paths = scan_images(folder, trust_extensions_only=True)
+    image_paths = scan_images(folder)
     if not image_paths:
         st.error("No images found in folder.")
     else:
         st.session_state.index_paths = image_paths
         progress1.progress(0)
         progress2.progress(0)
-        phase1_placeholder.text(f"Phase 1: starting… 0% (0/{len(image_paths)})")
-        phase2_placeholder.text("Phase 2: idle")
+        phase1_placeholder.text("Phase 1: starting…")
+        phase2_placeholder.text("")
 
         def p1_cb(done, total):
-            # Update progress counters in session state; UI pulls these values
-            st.session_state.p1_done = done
-            st.session_state.p1_total = total
-            st.session_state.phase1_status = "running"
+            pct = int(done/total*100) if total else 0
+            progress1.progress(pct)
+            phase1_placeholder.text(f"Phase 1: embeddings {pct}% ({done}/{total})")
+            if done % max(1, total//20 or 1) == 0:
+                log_placeholder.write(f"Phase 1 progress: {done}/{total}")
 
         def p2_cb(done, total):
-            # Update progress counters in session state; UI pulls these values
-            st.session_state.p2_done = done
-            st.session_state.p2_total = total
-            st.session_state.phase2_status = "running"
+            pct = int(done/total*100) if total else 0
+            progress2.progress(pct)
+            phase2_placeholder.text(f"Phase 2: captions {pct}% ({done}/{total})")
+            if done % max(1, total//20 or 1) == 0:
+                log_placeholder.write(f"Phase 2 progress: {done}/{total}")
 
-        def run_indexing_manager():
-            try:
-                st.session_state.indexing_running = True
-                # Phase 1
-                st.session_state.phase1_status = "starting"
-                idx_comb, idx_clip, comb_embs, clip_embs, meta, pca_obj = phase1_index(image_paths, progress_cb=p1_cb)
-                st.session_state.faiss_combined = idx_comb
-                st.session_state.faiss_clip = idx_clip
-                st.session_state.pca_obj = pca_obj
-                st.session_state.phase1_duration = time.time() - st.session_state.index_start_time if st.session_state.index_start_time else None
-                st.session_state.phase1_ready = True
-                st.session_state.phase1_status = "done"
-                phase1_placeholder.text("Phase 1: complete")
-                start_watcher(folder)
-                # Phase 2: sequential in manager when not concurrent
-                if concurrent_phase2 and ollama_installed() and model_available("llava"):
-                    # Spawn captions in separate thread to allow UI responsiveness
-                    def _run_p2():
-                        try:
-                            phase2_caption(image_paths, progress_cb=p2_cb)
-                            if st.session_state.index_start_time:
-                                st.session_state.phase2_duration = time.time() - st.session_state.index_start_time
-                                if st.session_state.phase1_duration is not None:
-                                    st.session_state.total_index_duration = st.session_state.phase2_duration
-                            st.session_state.phase2_ready = True
-                            st.session_state.phase2_status = "done"
-                            phase2_placeholder.text("Phase 2: complete")
-                        except Exception as exc:
-                            st.session_state.index_error = f"Phase 2 error: {exc}"
-                            st.sidebar.error(st.session_state.index_error)
-                    threading.Thread(target=_run_p2, daemon=True).start()
-                else:
-                    if ollama_installed() and model_available("llava"):
+        if concurrent_phase2 and ollama_installed() and model_available("llava"):
+            def run_p1():
+                with st.spinner("Indexing images (Phase 1)…"):
+                    try:
+                        idx_comb, idx_clip, comb_embs, clip_embs, meta, pca_obj = phase1_index(image_paths, progress_cb=p1_cb)
+                        st.session_state.faiss_combined = idx_comb
+                        st.session_state.faiss_clip = idx_clip
+                        st.session_state.pca_obj = pca_obj
+                        st.session_state.phase1_ready = True
+                        phase1_placeholder.text("Phase 1: complete")
+                        start_watcher(folder)
+                    except Exception as exc:
+                        st.sidebar.error(f"Phase 1 error: {exc}")
+            def run_p2():
+                with st.spinner("Generating captions (Phase 2)…"):
+                    try:
                         phase2_caption(image_paths, progress_cb=p2_cb)
-                        if st.session_state.index_start_time:
-                            st.session_state.phase2_duration = time.time() - st.session_state.index_start_time
-                            if st.session_state.phase1_duration is not None:
-                                st.session_state.total_index_duration = st.session_state.phase2_duration
                         st.session_state.phase2_ready = True
-                        st.session_state.phase2_status = "done"
                         phase2_placeholder.text("Phase 2: complete")
-            except Exception as exc:
-                st.session_state.index_error = f"Indexing error: {exc}"
-                st.sidebar.error(st.session_state.index_error)
-            finally:
-                # Ensure UI is updated even if an early failure occurs
+                    except Exception as exc:
+                        st.sidebar.error(f"Phase 2 error: {exc}")
+            threading.Thread(target=run_p1, daemon=True).start()
+            threading.Thread(target=run_p2, daemon=True).start()
+        else:
+            # Run sequentially for predictable resource usage
+            with st.spinner("Indexing images (Phase 1)…"):
                 try:
-                    progress1.progress(100)
-                    phase1_placeholder.text("Phase 1: complete or aborted")
-                except Exception:
-                    pass
-                st.session_state.indexing_running = False
-
-        threading.Thread(target=run_indexing_manager, daemon=True).start()
+                    idx_comb, idx_clip, comb_embs, clip_embs, meta, pca_obj = phase1_index(image_paths, progress_cb=p1_cb)
+                    st.session_state.faiss_combined = idx_comb
+                    st.session_state.faiss_clip = idx_clip
+                    st.session_state.pca_obj = pca_obj
+                    st.session_state.phase1_ready = True
+                    phase1_placeholder.text("Phase 1: complete")
+                    start_watcher(folder)
+                except Exception as exc:
+                    st.sidebar.error(f"Phase 1 error: {exc}")
+            with st.spinner("Generating captions (Phase 2)…"):
+                try:
+                    phase2_caption(image_paths, progress_cb=p2_cb)
+                    st.session_state.phase2_ready = True
+                    phase2_placeholder.text("Phase 2: complete")
+                except Exception as exc:
+                    st.sidebar.error(f"Phase 2 error: {exc}")
 
 if save_idx_btn:
     if st.session_state.faiss_combined is not None:
