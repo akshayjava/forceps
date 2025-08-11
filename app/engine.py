@@ -175,6 +175,7 @@ import pickle
 import pickle
 import redis
 import json
+import yaml
 import onnxruntime as ort
 
 def load_onnx_models(model_dir: str):
@@ -205,52 +206,55 @@ def load_onnx_models(model_dir: str):
 
 def main():
     parser = argparse.ArgumentParser(description="FORCEPS Worker Engine")
-
-    # Model & Performance args
-    parser.add_argument("--model_dir", type=str, required=True, help="Directory with ONNX models.")
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for model inference.")
-    parser.add_argument("--max_workers", type=int, default=8, help="Max workers for DataLoader.")
-
-    # Redis args
-    parser.add_argument("--redis_host", type=str, default="localhost", help="Redis server host.")
-    parser.add_argument("--redis_port", type=int, default=6379, help="Redis server port.")
-    parser.add_argument("--job_queue", type=str, default="forceps:job_queue", help="Redis queue for jobs.")
-    parser.add_argument("--results_queue", type=str, default="forceps:results_queue", help="Redis queue for results.")
-
+    parser.add_argument("--config", type=str, default="app/config.yaml", help="Path to the configuration file.")
     args = parser.parse_args()
+
+    try:
+        with open(args.config, 'r') as f:
+            config = yaml.safe_load(f)
+    except FileNotFoundError:
+        logger.error(f"Configuration file not found at: {args.config}")
+        return
+    except Exception as e:
+        logger.error(f"Error reading configuration file: {e}")
+        return
+
+    cfg_redis = config['redis']
+    cfg_models = config['models']
+    cfg_perf = config['performance']['worker']
+
+    # Create a simple namespace object to pass to functions that expect it
+    worker_args = argparse.Namespace(
+        batch_size=cfg_perf['batch_size'],
+        max_workers=cfg_perf['max_workers']
+    )
 
     logger.info("--- FORCEPS Worker Engine Starting ---")
 
-    # 1. Connect to Redis
     try:
-        r = redis.Redis(host=args.redis_host, port=args.redis_port, db=0)
+        r = redis.Redis(host=cfg_redis['host'], port=cfg_redis['port'], db=0)
         r.ping()
-        logger.info(f"Successfully connected to Redis at {args.redis_host}:{args.redis_port}")
+        logger.info(f"Successfully connected to Redis at {cfg_redis['host']}:{cfg_redis['port']}")
     except redis.exceptions.ConnectionError as e:
         logger.error(f"Could not connect to Redis: {e}")
         return
 
-    # 2. Load ONNX models once per worker
     logger.info("Loading ONNX models...")
-    models = load_onnx_models(args.model_dir)
+    models = load_onnx_models(cfg_models['onnx_dir'])
 
-    # 3. Main worker loop
-    logger.info(f"Worker listening for jobs on '{args.job_queue}'...")
+    logger.info(f"Worker listening for jobs on '{cfg_redis['job_queue']}'...")
     while True:
         try:
-            # Blocking pop from the job queue
-            _, job_data = r.blpop(args.job_queue)
+            _, job_data = r.blpop(cfg_redis['job_queue'])
             image_paths = json.loads(job_data)
 
             logger.info(f"Received job with {len(image_paths)} images.")
 
-            # Process the job to get embeddings
-            results = compute_embeddings_for_job(image_paths, models, args)
+            results = compute_embeddings_for_job(image_paths, models, worker_args)
 
-            # Push results to the results queue
             if results:
-                r.rpush(args.results_queue, json.dumps(results))
-                logger.info(f"Pushed {len(results)} embeddings to '{args.results_queue}'.")
+                r.rpush(cfg_redis['results_queue'], json.dumps(results))
+                logger.info(f"Pushed {len(results)} embeddings to '{cfg_redis['results_queue']}'.")
 
             logger.info(f"Finished processing job. Waiting for next job...")
 

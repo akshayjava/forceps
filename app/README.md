@@ -21,9 +21,48 @@ The system is composed of several key components that work together:
 4.  **Index Builder (`build_index.py`):** A script that consumes the results from the workers, aggregates all embeddings, and builds the final, compressed FAISS index.
 5.  **User Interface (`main.py`):** A Streamlit application that can be used to start the enqueueing process and to search the final, completed index.
 
-## Quickstart (Distributed Indexing)
+## Running with Docker Compose (Recommended)
 
-This guide explains how to run the full distributed pipeline.
+The easiest way to run the entire FORCEPS stack is with `docker-compose`. This will build the application image and run all services (Redis, UI, Worker, etc.) with the correct configuration.
+
+### 1. Prerequisites
+- **Install Docker and Docker Compose.**
+- **NVIDIA GPU Users:** Ensure you have the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) installed to enable GPU access within Docker.
+- **Prepare your data:**
+  - Create a directory on your host machine for your images (e.g., `./images`).
+  - Create a directory for the output index (e.g., `./output_index`).
+  - The `docker-compose.yml` is pre-configured to mount `./images` to `/data/input_images` and `./output_index` to `/data/output_index` inside the containers. Edit `docker-compose.yml` if your host paths are different.
+- **(Optional) Convert models to ONNX:** For maximum performance, run the conversion script on your host *before* building the Docker image.
+  ```bash
+  # Make sure you have the python environment set up
+  ./install.sh
+  source ./venv_forceps/bin/activate
+  python app/convert_models.py --output_dir models/onnx
+  ```
+
+### 2. Launch the Application
+From the root of the project directory, run:
+```bash
+docker-compose up --build
+```
+This will:
+1. Build the `forceps` Docker image from the `Dockerfile`.
+2. Start all services defined in `docker-compose.yml` (Redis, UI, Indexer, etc.).
+
+### 3. Scale Workers (Optional)
+To process your data faster, you can scale up the number of worker services. For example, to run 4 workers in parallel:
+```bash
+docker-compose up --build --scale worker=4
+```
+
+### 4. Using the System
+- **Access the UI:** Open your web browser to `http://localhost:8501`.
+- **Start Indexing:** Use the UI to select your input folder and kick off the indexing process. The `enqueuer` service will start, and the workers will begin processing images. You can monitor the Redis queues from the UI.
+- **Search:** Once the `indexer` service completes (you can view its logs with `docker-compose logs -f indexer`), use the UI to load the index from the output directory and begin searching.
+
+## Manual Quickstart (Distributed Indexing)
+
+This guide explains how to run the full distributed pipeline manually without Docker.
 
 ### 1. Prerequisites
 - **Install Python dependencies:**

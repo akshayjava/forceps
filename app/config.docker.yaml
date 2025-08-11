@@ -1,0 +1,46 @@
+# FORCEPS Configuration File for Docker
+# This file uses paths that are valid INSIDE the containers.
+# The docker-compose.yml file maps host directories to these paths.
+
+# Redis service name as defined in docker-compose.yml
+redis:
+  host: "redis"
+  port: 6379
+  job_queue: "forceps:job_queue"
+  results_queue: "forceps:results_queue"
+
+# Directories for data I/O (paths are inside the container)
+data:
+  # This path is mounted from the host in docker-compose.yml
+  input_dir: "/data/input_images"
+  # This path is where the final index is saved inside the container
+  output_dir: "/data/output_index"
+
+# Path to the directory containing the converted ONNX models
+models:
+  onnx_dir: "/app/models/onnx"
+
+# Performance tuning parameters
+performance:
+  # Settings for the worker engine (engine.py)
+  worker:
+    batch_size: 16
+    max_workers: 8
+
+  # Settings for the enqueuer script (enqueue_jobs.py)
+  enqueuer:
+    job_batch_size: 1024
+    scan_max_workers: 8
+
+  # Settings for the FAISS index builder (build_index.py)
+  faiss:
+    use_pca: false
+    pca_dim: 384
+    ivf_nlist: 4096
+    pq_m: 64
+    train_samples: 5000
+    add_batch: 8192
+
+# Feature flags
+features:
+  enable_captions: false

@@ -1,0 +1,46 @@
+# FORCEPS Configuration File
+# Copy this file to config.yaml and edit as needed.
+
+# Redis connection details for the job queue
+redis:
+  host: "localhost"
+  port: 6379
+  job_queue: "forceps:job_queue"
+  results_queue: "forceps:results_queue"
+
+# Directories for data I/O
+data:
+  # Input directory for the enqueuer to scan for images
+  input_dir: "/path/to/your/images"
+  # Output directory for the index builder to save the final index files
+  output_dir: "output_index"
+
+# Path to the directory containing the converted ONNX models
+models:
+  onnx_dir: "models/onnx"
+
+# Performance tuning parameters
+performance:
+  # Settings for the worker engine (engine.py)
+  worker:
+    batch_size: 16
+    max_workers: 8 # For the DataLoader
+
+  # Settings for the enqueuer script (enqueue_jobs.py)
+  enqueuer:
+    job_batch_size: 1024 # Number of images per job
+    scan_max_workers: 8 # For parallel directory scanning
+
+  # Settings for the FAISS index builder (build_index.py)
+  faiss:
+    use_pca: false
+    pca_dim: 384
+    ivf_nlist: 4096
+    pq_m: 64
+    train_samples: 5000
+    add_batch: 8192
+
+# Feature flags
+features:
+  # Enable captioning (Note: requires a separate captioning worker, not yet implemented)
+  enable_captions: false
