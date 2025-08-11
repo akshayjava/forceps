@@ -95,8 +95,13 @@ def collate_fn(batch):
     return vit_tensors, clip_tensors, paths
 
 def compute_embeddings_for_job(image_paths, models, args):
-    logger.info(f"Processing job of {len(image_paths)} images.")
-    vit_model, clip_model, preprocess_vit, preprocess_clip, _, clip_dim = models
+    logger.info(f"Processing job of {len(image_paths)} images with ONNX runtime.")
+
+    vit_session = models["vit_session"]
+    clip_session = models["clip_session"]
+    preprocess_vit = models["preprocess_vit"]
+    preprocess_clip = models["preprocess_clip"]
+    clip_dim = models["clip_dim"]
 
     dataset = ForcepsDataset(image_paths, preprocess_vit, preprocess_clip)
     dataloader = torch.utils.data.DataLoader(
@@ -112,18 +117,34 @@ def compute_embeddings_for_job(image_paths, models, args):
     for vit_tensor_batch, clip_tensor_batch, paths in dataloader:
         if vit_tensor_batch is None: continue
 
-        vit_batch_list = [t for t in vit_tensor_batch]
-        clip_batch_list = [t for t in clip_tensor_batch] if clip_tensor_batch is not None else []
+        # Run ViT ONNX model
+        vit_input_name = vit_session.get_inputs()[0].name
+        vit_output_name = vit_session.get_outputs()[0].name
+        emb_vit = vit_session.run([vit_output_name], {vit_input_name: vit_tensor_batch.numpy()})[0]
 
-        combined_batch, clip_batch_emb = compute_batch_embeddings(vit_batch_list, clip_batch_list, vit_model, clip_model)
+        # Run CLIP ONNX model if it exists
+        emb_clip = None
+        if clip_session and clip_tensor_batch is not None:
+            clip_input_name = clip_session.get_inputs()[0].name
+            clip_output_name = clip_session.get_outputs()[0].name
+            emb_clip = clip_session.run([clip_output_name], {clip_input_name: clip_tensor_batch.numpy()})[0]
 
+        # Normalize embeddings
+        emb_vit = emb_vit / (np.linalg.norm(emb_vit, axis=1, keepdims=True) + 1e-10)
+        if emb_clip is not None:
+            emb_clip = emb_clip / (np.linalg.norm(emb_clip, axis=1, keepdims=True) + 1e-10)
+            combined_batch = np.concatenate([emb_vit, emb_clip], axis=1)
+        else:
+            combined_batch = emb_vit
+
+        # Append results
         for i, path in enumerate(paths):
             result = {"path": path, "combined_emb": combined_batch[i].tolist()}
-            if clip_dim > 0 and clip_batch_emb is not None:
-                result["clip_emb"] = clip_batch_emb[i].tolist()
+            if clip_dim > 0 and emb_clip is not None:
+                result["clip_emb"] = emb_clip[i].tolist()
             results.append(result)
 
-    logger.info(f"Finished job, produced {len(results)} embeddings.")
+    logger.info(f"Finished ONNX job, produced {len(results)} embeddings.")
     return results
 
 def _caption_one_image(p):
@@ -154,11 +175,39 @@ import pickle
 import pickle
 import redis
 import json
+import onnxruntime as ort
+
+def load_onnx_models(model_dir: str):
+    logger.info(f"Loading ONNX models from {model_dir}...")
+    # It's good practice to specify providers, especially for TensorRT execution
+    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+
+    vit_path = os.path.join(model_dir, "vit.onnx")
+    vit_session = ort.InferenceSession(vit_path, providers=providers)
+
+    clip_session = None
+    clip_path = os.path.join(model_dir, "clip_visual.onnx")
+    if os.path.exists(clip_path):
+        clip_session = ort.InferenceSession(clip_path, providers=providers)
+
+    # We still need the preprocessors from the original models
+    _, _, preprocess_vit, preprocess_clip, vit_dim, clip_dim = load_models()
+
+    models = {
+        "vit_session": vit_session,
+        "clip_session": clip_session,
+        "preprocess_vit": preprocess_vit,
+        "preprocess_clip": preprocess_clip,
+        "vit_dim": vit_dim, # This might need to be hardcoded or saved with the model
+        "clip_dim": clip_dim
+    }
+    return models
 
 def main():
     parser = argparse.ArgumentParser(description="FORCEPS Worker Engine")
 
-    # Performance args
+    # Model & Performance args
+    parser.add_argument("--model_dir", type=str, required=True, help="Directory with ONNX models.")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for model inference.")
     parser.add_argument("--max_workers", type=int, default=8, help="Max workers for DataLoader.")
 
@@ -181,9 +230,9 @@ def main():
         logger.error(f"Could not connect to Redis: {e}")
         return
 
-    # 2. Load models once per worker
-    logger.info("Loading AI models...")
-    models = load_models()
+    # 2. Load ONNX models once per worker
+    logger.info("Loading ONNX models...")
+    models = load_onnx_models(args.model_dir)
 
     # 3. Main worker loop
     logger.info(f"Worker listening for jobs on '{args.job_queue}'...")

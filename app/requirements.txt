@@ -8,6 +8,8 @@ imagehash
 opencv-python-headless
 PyTurboJPEG
 redis
+onnx
+onnxruntime
 piexif
 python-magic
 git+https://github.com/openai/CLIP.git
