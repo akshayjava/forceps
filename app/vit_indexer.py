@@ -904,7 +904,7 @@ def estimate_processing_time():
     print(f"  • Use NVMe RAID 0 for I/O bottleneck")
     print(f"  • Consider ONNX + TensorRT for 3-5x speedup")
     print(f"  • Model quantization: INT8 for 2-4x with quality loss")
-    print(f"  • Distributed processing across multiple nodes") kernels for fixed input sizes")
+    print(f"  • Distributed processing across multiple nodes")
     print(f"  ✓ Optimized DataLoader: More workers, prefetching, pin_memory")
     print(f"  ✓ Memory Management: Less frequent cache clearing")
     
