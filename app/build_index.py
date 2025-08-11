@@ -9,6 +9,7 @@ import argparse
 import logging
 import redis
 import json
+import yaml
 import numpy as np
 import faiss
 import pickle
@@ -67,47 +68,49 @@ def build_index_for_embeddings(embeddings, d, n, args):
 
 def main():
     parser = argparse.ArgumentParser(description="FORCEPS Index Builder")
-    parser.add_argument("--output_dir", type=str, required=True, help="Directory to save the FAISS index and metadata.")
-
-    # Redis args
-    parser.add_argument("--redis_host", type=str, default="localhost", help="Redis server host.")
-    parser.add_argument("--redis_port", type=int, default=6379, help="Redis server port.")
-    parser.add_argument("--results_queue", type=str, default="forceps:results_queue", help="Redis queue for results.")
-
-    # FAISS args (should match the engine's defaults)
-    parser.add_argument("--use_pca", action='store_true', help="Enable PCA for dimensionality reduction.")
-    parser.add_argument("--pca_dim", type=int, default=384, help="Dimension after PCA.")
-    parser.add_argument("--ivf_nlist", type=int, default=4096, help="Number of IVF clusters.")
-    parser.add_argument("--pq_m", type=int, default=64, help="Number of sub-quantizers for PQ.")
-    parser.add_argument("--train_samples", type=int, default=5000, help="Number of samples to train FAISS index.")
-    parser.add_argument("--add_batch", type=int, default=8192, help="Batch size for adding vectors to FAISS index.")
-
+    parser.add_argument("--config", type=str, default="app/config.yaml", help="Path to the configuration file.")
     args = parser.parse_args()
+
+    try:
+        with open(args.config, 'r') as f:
+            config = yaml.safe_load(f)
+    except FileNotFoundError:
+        logger.error(f"Configuration file not found at: {args.config}")
+        return
+    except Exception as e:
+        logger.error(f"Error reading configuration file: {e}")
+        return
+
+    cfg_redis = config['redis']
+    cfg_data = config['data']
+    cfg_faiss = config['performance']['faiss']
+
+    # Create a simple namespace object for the build_index_for_embeddings function
+    faiss_args = argparse.Namespace(**cfg_faiss)
 
     logger.info("--- FORCEPS Index Builder Starting ---")
 
     try:
-        r = redis.Redis(host=args.redis_host, port=args.redis_port, db=0)
+        r = redis.Redis(host=cfg_redis['host'], port=cfg_redis['port'], db=0)
         r.ping()
-        logger.info(f"Successfully connected to Redis at {args.redis_host}:{args.redis_port}")
+        logger.info(f"Successfully connected to Redis at {cfg_redis['host']}:{cfg_redis['port']}")
     except redis.exceptions.ConnectionError as e:
         logger.error(f"Could not connect to Redis: {e}")
         return
 
     # 1. Consume results from the queue
-    logger.info(f"Consuming results from queue '{args.results_queue}'...")
+    logger.info(f"Consuming results from queue '{cfg_redis['results_queue']}'...")
     all_results = []
     while True:
-        # Pop up to 100 items at a time to be efficient
         pipe = r.pipeline()
-        pipe.lrange(args.results_queue, 0, 99)
-        pipe.ltrim(args.results_queue, 100, -1)
+        pipe.lrange(cfg_redis['results_queue'], 0, 99)
+        pipe.ltrim(cfg_redis['results_queue'], 100, -1)
         items = pipe.execute()[0]
 
         if not items:
             logger.info("No more results in queue. Waiting for more...")
-            time.sleep(10) # Wait for more results
-            if not r.lrange(args.results_queue, 0, 0): # Check if still empty
+            time.sleep(10)
+            if not r.lrange(cfg_redis['results_queue'], 0, 0):
                 logger.info("Queue appears empty. Finalizing index.")
                 break
             else:
@@ -134,16 +137,16 @@ def main():
     n, d_comb = combined_embs.shape
 
     # 3. Build indexes
-    index_comb, pca_matrix = build_index_for_embeddings(combined_embs, d_comb, n, args)
+    index_comb, pca_matrix = build_index_for_embeddings(combined_embs, d_comb, n, faiss_args)
 
     index_clip = None
     if has_clip and clip_embs is not None:
         _, d_clip = clip_embs.shape
-        index_clip, _ = build_index_for_embeddings(clip_embs, d_clip, n, args)
+        index_clip, _ = build_index_for_embeddings(clip_embs, d_clip, n, faiss_args)
 
     # 4. Save results
     logger.info("Saving final FAISS indexes, PCA matrix, and path mapping...")
-    output_dir = Path(args.output_dir)
+    output_dir = Path(cfg_data['output_dir'])
     output_dir.mkdir(exist_ok=True)
 
     faiss.write_index(index_comb, str(output_dir / "combined.index"))
