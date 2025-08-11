@@ -2,9 +2,11 @@ streamlit>=1.20
 torch>=1.13.0
 torchvision
 transformers>=4.20
-faiss-cpu
+faiss-gpu
 Pillow
 imagehash
+opencv-python-headless
+PyTurboJPEG
 piexif
 python-magic
 git+https://github.com/openai/CLIP.git

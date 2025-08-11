@@ -624,59 +624,69 @@ def phase1_index(image_paths, progress_cb=None):
             if progress_cb: progress_cb(processed, n)
 
     # Build FAISS IVF-PQ index (optionally with PCA) for scale
-    faiss.omp_set_num_threads(1)
+    faiss.omp_set_num_threads(max(1, MAX_WORKERS // 2))
+    use_gpu = (DEVICE == "cuda" and hasattr(faiss, "GpuResources"))
+    gpu_res = faiss.GpuResources() if use_gpu else None
+
+    # --- Combined Index ---
     xb = np.asarray(combined_embs)
     d = xb.shape[1]
     index_comb = None
     pca_ret = None
-    # Effective training/sample sizes and cluster counts
     num_train = min(n, TRAIN_SAMPLES)
-    # Heuristic: nlist ~ 4 * sqrt(N), capped by available training points
     nlist_eff = max(1, int(np.sqrt(max(1, n))) * 4)
     nlist_eff = min(IVF_NLIST, nlist_eff, max(1, num_train))
-    # Choose PQ_M that divides dimension to avoid FAISS assertions
+
     def choose_m(dim: int, m_pref: int) -> int:
         candidates = [m for m in [m_pref, 64, 48, 32, 24, 16, 12, 8, 6, 4, 3, 2, 1] if m <= dim and dim % m == 0]
         return candidates[0] if candidates else 1
+
+    d_final = d
     if USE_PCA:
         eff_pca_dim = max(1, min(PCA_DIM, d, num_train))
         pca_mat = faiss.PCAMatrix(d, eff_pca_dim)
-        pca_mat.train(xb[: num_train])
+        pca_mat.train(xb[:num_train])
         pca_ret = pca_mat
-        d_red = eff_pca_dim
-        quantizer = faiss.IndexFlatL2(d_red)
-        pq_m_eff = choose_m(d_red, PQ_M)
-        index_comb = faiss.IndexIVFPQ(quantizer, d_red, nlist_eff, pq_m_eff, 8)
-        # Train
-        xb_train = pca_mat.apply_py(xb[: num_train])
-        index_comb.train(xb_train)
-        # Add in batches
-        for off in range(0, n, ADD_BATCH):
-            x = pca_mat.apply_py(xb[off : off + ADD_BATCH])
-            index_comb.add(x)
-    else:
-        quantizer = faiss.IndexFlatL2(d)
-        pq_m_eff = choose_m(d, PQ_M)
-        index_comb = faiss.IndexIVFPQ(quantizer, d, nlist_eff, pq_m_eff, 8)
-        index_comb.train(xb[: num_train])
-        for off in range(0, n, ADD_BATCH):
-            x = xb[off : off + ADD_BATCH]
-            index_comb.add(x)
+        d_final = eff_pca_dim
+
+    quantizer = faiss.IndexFlatL2(d_final)
+    pq_m_eff = choose_m(d_final, PQ_M)
+    cpu_index = faiss.IndexIVFPQ(quantizer, d_final, nlist_eff, pq_m_eff, 8)
+
+    index_to_train = faiss.index_cpu_to_gpu(gpu_res, 0, cpu_index) if use_gpu else cpu_index
+
+    train_data = pca_ret.apply_py(xb[:num_train]) if USE_PCA else xb[:num_train]
+    index_to_train.train(train_data)
+
+    # Add data in batches
+    for off in range(0, n, ADD_BATCH):
+        batch_data = xb[off : off + ADD_BATCH]
+        if USE_PCA:
+            batch_data = pca_ret.apply_py(batch_data)
+        index_to_train.add(batch_data)
+
+    index_comb = faiss.index_gpu_to_cpu(index_to_train) if use_gpu else index_to_train
     index_comb.nprobe = min(64, max(1, nlist_eff // 16))
 
+    # --- CLIP Index ---
     idx_clip = None
     if clip_embs is not None:
         xc = np.asarray(clip_embs)
         dc = xc.shape[1]
-        quantizer_c = faiss.IndexFlatL2(dc)
         num_train_c = min(n, TRAIN_SAMPLES)
         nlist_c = min(nlist_eff, max(1, num_train_c))
         pq_m_c = choose_m(dc, max(8, PQ_M // 2))
-        idx_clip = faiss.IndexIVFPQ(quantizer_c, dc, nlist_c, pq_m_c, 8)
-        idx_clip.train(xc[: num_train_c])
+
+        quantizer_c = faiss.IndexFlatL2(dc)
+        cpu_index_c = faiss.IndexIVFPQ(quantizer_c, dc, nlist_c, pq_m_c, 8)
+
+        index_to_train_c = faiss.index_cpu_to_gpu(gpu_res, 0, cpu_index_c) if use_gpu else cpu_index_c
+        index_to_train_c.train(xc[:num_train_c])
+
         for off in range(0, n, ADD_BATCH):
-            x = xc[off : off + ADD_BATCH]
-            idx_clip.add(x)
+            index_to_train_c.add(xc[off : off + ADD_BATCH])
+
+        idx_clip = faiss.index_gpu_to_cpu(index_to_train_c) if use_gpu else index_to_train_c
         idx_clip.nprobe = min(64, max(1, nlist_c // 16))
 
     # Flush memmaps
@@ -695,23 +705,37 @@ def phase1_index(image_paths, progress_cb=None):
         pass
     return index_comb, idx_clip, combined_embs, clip_embs, metadata, pca_ret
 
-def phase2_caption(image_paths, progress_cb=None):
-    if not ollama_installed() or not model_available("llava"):
-        for i in range(len(image_paths)):
-            if progress_cb: progress_cb(i+1, len(image_paths))
-        return
-    for i, p in enumerate(image_paths):
+def _caption_one_image(p):
+    """Helper for parallel captioning"""
+    try:
         fp = fingerprint(Path(p))
         cached = load_cache(fp) or {}
         meta = cached.get("metadata", {})
         if meta.get("caption"):
-            if progress_cb: progress_cb(i+1, len(image_paths)); continue
+            return True # Already captioned
         cap = generate_caption_ollama(p)
         if cap:
             meta["caption"] = cap
             cached["metadata"] = meta
             save_cache(fp, cached)
-        if progress_cb: progress_cb(i+1, len(image_paths))
+        return True
+    except Exception:
+        return False
+
+def phase2_caption(image_paths, progress_cb=None):
+    if not ollama_installed() or not model_available("llava"):
+        if progress_cb:
+            for i in range(len(image_paths)):
+                progress_cb(i + 1, len(image_paths))
+        return
+
+    n_paths = len(image_paths)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(_caption_one_image, p): p for p in image_paths}
+        for i, future in enumerate(as_completed(futures)):
+            future.result()  # Raise exceptions if any
+            if progress_cb:
+                progress_cb(i + 1, n_paths)
 
 # ---- Incremental watcher ----
 def _incremental_add(new_paths):
