@@ -7,3 +7,5 @@ dist/
 *.index
 *.zip
 *.DS_Store
+
+.venv/
