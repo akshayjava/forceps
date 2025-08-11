@@ -31,6 +31,9 @@ import shutil
 from PIL import Image
 import numpy as np
 import faiss
+import redis
+import json
+import pickle
 try:
     faiss.omp_set_num_threads(1)
 except Exception:
@@ -496,246 +499,8 @@ if use_mtime_filter:
         from_ts = None
         to_ts = None
 
-def scan_images(root, trust_extensions_only: bool = True):
-    p = Path(root)
-    if not p.exists():
-        return []
-    # Faster extension-based scan to avoid walking every non-image file
-    exts = [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".webp"]
-    candidates = []
-    try:
-        for ext in exts:
-            candidates.extend([str(x) for x in p.rglob(f"*{ext}")])
-            up = ext.upper()
-            if up != ext:
-                candidates.extend([str(x) for x in p.rglob(f"*{up}")])
-    except Exception:
-        # Fallback to generic scan
-        candidates = [str(x) for x in p.rglob("*") if x.is_file()]
-    if trust_extensions_only:
-        files = candidates
-    else:
-        # Final filter (slower)
-        files = [c for c in candidates if is_image_file(Path(c))]
-    # Deduplicate while preserving order
-    seen = set()
-    unique = []
-    for f in files:
-        if f not in seen:
-            unique.append(f)
-            seen.add(f)
-    return unique
-
-def phase1_index(image_paths, progress_cb=None):
-    n = len(image_paths)
-    # Out-of-core: memmap to limit RAM usage
-    comb_path = CACHE_DIR / "embeddings_combined.mmap"
-    combined_embs = np.memmap(comb_path, dtype="float32", mode="w+", shape=(n, COMBINED_DIM))
-    clip_embs = None
-    if clip_dim > 0:
-        clip_path = CACHE_DIR / "embeddings_clip.mmap"
-        clip_embs = np.memmap(clip_path, dtype="float32", mode="w+", shape=(n, clip_dim))
-    metadata = [None] * n
-    idx_map = {p: i for i, p in enumerate(image_paths)}
-
-    vit_batch = []
-    clip_batch = []
-    batch_idxs = []
-    batch_paths = []
-
-    # Submit tasks in chunks to avoid overwhelming the scheduler on huge datasets
-    CHUNK = max(256, BATCH_SIZE * 8)
-    processed = 0
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        for off in range(0, n, CHUNK):
-            batch_paths_all = image_paths[off: off + CHUNK]
-            futures = {ex.submit(preprocess_image_for_vit_clip, p, preprocess_vit, preprocess_clip): p for p in batch_paths_all}
-            for fut in as_completed(futures):
-                processed += 1
-                res = fut.result()
-            if res is None:
-                if progress_cb: progress_cb(processed, n)
-                continue
-            path_str, pil_im, vit_tensor, clip_tensor = res
-            i = idx_map[path_str]
-            fp = fingerprint(Path(path_str))
-            cached = load_cache(fp)
-            if cached and "embedding_combined" in cached:
-                emb_c_np = np.array(cached["embedding_combined"], dtype=np.float32)
-                combined_embs[i] = emb_c_np
-                emb_clip_np = None
-                if clip_embs is not None and cached.get("embedding_clip") is not None:
-                    emb_clip_np = np.array(cached["embedding_clip"], dtype=np.float32)
-                    clip_embs[i] = emb_clip_np
-                metadata[i] = cached.get("metadata", {})
-                # Immediately make cached items searchable in partial indices
-                try:
-                    if st.session_state.faiss_partial is not None:
-                        st.session_state.faiss_partial.add_with_ids(emb_c_np.reshape(1, -1), np.array([i], dtype=np.int64))
-                    if st.session_state.faiss_clip_partial is not None and emb_clip_np is not None:
-                        st.session_state.faiss_clip_partial.add_with_ids(emb_clip_np.reshape(1, -1), np.array([i], dtype=np.int64))
-                except Exception:
-                    pass
-            else:
-                vit_batch.append(vit_tensor)
-                clip_batch.append(clip_tensor if clip_tensor is not None else vit_tensor)
-                batch_idxs.append(i)
-                batch_paths.append(path_str)
-                metadata[i] = {"exif": read_exif(Path(path_str)), "hashes": compute_perceptual_hashes(Path(path_str))}
-            if len(batch_idxs) >= max(1, BATCH_SIZE // 2):
-                combined_batch, clip_batch_emb = compute_batch_embeddings(vit_batch, clip_batch, vit_model, clip_model)
-                for idx_local, emb_c, emb_clip, pth in zip(batch_idxs, combined_batch, clip_batch_emb if clip_batch_emb is not None else [None]*len(batch_idxs), batch_paths):
-                    combined_embs[idx_local] = emb_c
-                    if clip_embs is not None and emb_clip is not None:
-                        clip_embs[idx_local] = emb_clip
-                    save_cache(fingerprint(Path(pth)), {"embedding_combined": emb_c.tolist(), "embedding_clip": (emb_clip.tolist() if emb_clip is not None else None), "metadata": metadata[idx_local]})
-                # Add to partial indices with IDs matching idx_local
-                try:
-                    if st.session_state.faiss_partial is not None:
-                        ids = np.array(batch_idxs, dtype=np.int64)
-                        st.session_state.faiss_partial.add_with_ids(np.array(combined_batch, dtype=np.float32), ids)
-                    if st.session_state.faiss_clip_partial is not None and clip_batch_emb is not None:
-                        ids = np.array(batch_idxs, dtype=np.int64)
-                        st.session_state.faiss_clip_partial.add_with_ids(np.array(clip_batch_emb, dtype=np.float32), ids)
-                except Exception:
-                    pass
-                vit_batch.clear(); clip_batch.clear(); batch_idxs.clear(); batch_paths.clear()
-                if progress_cb: progress_cb(processed, n)
-                # yield to event loop to keep Streamlit responsive
-                time.sleep(0.0005)
-
-        if batch_idxs:
-            combined_batch, clip_batch_emb = compute_batch_embeddings(vit_batch, clip_batch, vit_model, clip_model)
-            for idx_local, emb_c, emb_clip, pth in zip(batch_idxs, combined_batch, clip_batch_emb if clip_batch_emb is not None else [None]*len(batch_idxs), batch_paths):
-                combined_embs[idx_local] = emb_c
-                if clip_embs is not None and emb_clip is not None:
-                    clip_embs[idx_local] = emb_clip
-                save_cache(fingerprint(Path(pth)), {"embedding_combined": emb_c.tolist(), "embedding_clip": (emb_clip.tolist() if emb_clip is not None else None), "metadata": metadata[idx_local]})
-            # flush to partial indices as well
-            try:
-                if st.session_state.faiss_partial is not None:
-                    ids = np.array(batch_idxs, dtype=np.int64)
-                    st.session_state.faiss_partial.add_with_ids(np.array(combined_batch, dtype=np.float32), ids)
-                if st.session_state.faiss_clip_partial is not None and clip_batch_emb is not None:
-                    ids = np.array(batch_idxs, dtype=np.int64)
-                    st.session_state.faiss_clip_partial.add_with_ids(np.array(clip_batch_emb, dtype=np.float32), ids)
-            except Exception:
-                pass
-            if progress_cb: progress_cb(processed, n)
-
-    # Build FAISS IVF-PQ index (optionally with PCA) for scale
-    faiss.omp_set_num_threads(max(1, MAX_WORKERS // 2))
-    use_gpu = (DEVICE == "cuda" and hasattr(faiss, "GpuResources"))
-    gpu_res = faiss.GpuResources() if use_gpu else None
-
-    # --- Combined Index ---
-    xb = np.asarray(combined_embs)
-    d = xb.shape[1]
-    index_comb = None
-    pca_ret = None
-    num_train = min(n, TRAIN_SAMPLES)
-    nlist_eff = max(1, int(np.sqrt(max(1, n))) * 4)
-    nlist_eff = min(IVF_NLIST, nlist_eff, max(1, num_train))
-
-    def choose_m(dim: int, m_pref: int) -> int:
-        candidates = [m for m in [m_pref, 64, 48, 32, 24, 16, 12, 8, 6, 4, 3, 2, 1] if m <= dim and dim % m == 0]
-        return candidates[0] if candidates else 1
-
-    d_final = d
-    if USE_PCA:
-        eff_pca_dim = max(1, min(PCA_DIM, d, num_train))
-        pca_mat = faiss.PCAMatrix(d, eff_pca_dim)
-        pca_mat.train(xb[:num_train])
-        pca_ret = pca_mat
-        d_final = eff_pca_dim
-
-    quantizer = faiss.IndexFlatL2(d_final)
-    pq_m_eff = choose_m(d_final, PQ_M)
-    cpu_index = faiss.IndexIVFPQ(quantizer, d_final, nlist_eff, pq_m_eff, 8)
-
-    index_to_train = faiss.index_cpu_to_gpu(gpu_res, 0, cpu_index) if use_gpu else cpu_index
-
-    train_data = pca_ret.apply_py(xb[:num_train]) if USE_PCA else xb[:num_train]
-    index_to_train.train(train_data)
-
-    # Add data in batches
-    for off in range(0, n, ADD_BATCH):
-        batch_data = xb[off : off + ADD_BATCH]
-        if USE_PCA:
-            batch_data = pca_ret.apply_py(batch_data)
-        index_to_train.add(batch_data)
-
-    index_comb = faiss.index_gpu_to_cpu(index_to_train) if use_gpu else index_to_train
-    index_comb.nprobe = min(64, max(1, nlist_eff // 16))
-
-    # --- CLIP Index ---
-    idx_clip = None
-    if clip_embs is not None:
-        xc = np.asarray(clip_embs)
-        dc = xc.shape[1]
-        num_train_c = min(n, TRAIN_SAMPLES)
-        nlist_c = min(nlist_eff, max(1, num_train_c))
-        pq_m_c = choose_m(dc, max(8, PQ_M // 2))
-
-        quantizer_c = faiss.IndexFlatL2(dc)
-        cpu_index_c = faiss.IndexIVFPQ(quantizer_c, dc, nlist_c, pq_m_c, 8)
-
-        index_to_train_c = faiss.index_cpu_to_gpu(gpu_res, 0, cpu_index_c) if use_gpu else cpu_index_c
-        index_to_train_c.train(xc[:num_train_c])
-
-        for off in range(0, n, ADD_BATCH):
-            index_to_train_c.add(xc[off : off + ADD_BATCH])
-
-        idx_clip = faiss.index_gpu_to_cpu(index_to_train_c) if use_gpu else index_to_train_c
-        idx_clip.nprobe = min(64, max(1, nlist_c // 16))
-
-    # Flush memmaps
-    try:
-        combined_embs.flush()
-        if clip_embs is not None:
-            clip_embs.flush()
-    except Exception:
-        pass
-    faiss.omp_set_num_threads(max(1, MAX_WORKERS))
-    # After full index built, discard partial indices to save RAM
-    try:
-        st.session_state.faiss_partial = None
-        st.session_state.faiss_clip_partial = None
-    except Exception:
-        pass
-    return index_comb, idx_clip, combined_embs, clip_embs, metadata, pca_ret
-
-def _caption_one_image(p):
-    """Helper for parallel captioning"""
-    try:
-        fp = fingerprint(Path(p))
-        cached = load_cache(fp) or {}
-        meta = cached.get("metadata", {})
-        if meta.get("caption"):
-            return True # Already captioned
-        cap = generate_caption_ollama(p)
-        if cap:
-            meta["caption"] = cap
-            cached["metadata"] = meta
-            save_cache(fp, cached)
-        return True
-    except Exception:
-        return False
-
-def phase2_caption(image_paths, progress_cb=None):
-    if not ollama_installed() or not model_available("llava"):
-        if progress_cb:
-            for i in range(len(image_paths)):
-                progress_cb(i + 1, len(image_paths))
-        return
-
-    n_paths = len(image_paths)
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(_caption_one_image, p): p for p in image_paths}
-        for i, future in enumerate(as_completed(futures)):
-            future.result()  # Raise exceptions if any
-            if progress_cb:
-                progress_cb(i + 1, n_paths)
+# Indexing logic is now handled by the standalone engine scripts.
+# The UI will now act as a controller for the distributed backend.
 
 # ---- Incremental watcher ----
 def _incremental_add(new_paths):
@@ -820,73 +585,26 @@ def _index_stats(idx):
 
 # Start two-phase indexing (reverted to stable behavior)
 if start_btn:
-    image_paths = scan_images(folder)
-    if not image_paths:
-        st.error("No images found in folder.")
-    else:
-        st.session_state.index_paths = image_paths
-        progress1.progress(0)
-        progress2.progress(0)
-        phase1_placeholder.text("Phase 1: starting…")
-        phase2_placeholder.text("")
+    st.info("Starting background process to enqueue indexing jobs...")
+    st.info("Ensure your workers (`engine.py`) and index builder (`build_index.py`) are running.")
 
-        def p1_cb(done, total):
-            pct = int(done/total*100) if total else 0
-            progress1.progress(pct)
-            phase1_placeholder.text(f"Phase 1: embeddings {pct}% ({done}/{total})")
-            if done % max(1, total//20 or 1) == 0:
-                log_placeholder.write(f"Phase 1 progress: {done}/{total}")
+    enqueue_script_path = Path(__file__).parent / "enqueue_jobs.py"
+    command = [
+        sys.executable,
+        str(enqueue_script_path),
+        "--input_dir",
+        folder
+    ]
 
-        def p2_cb(done, total):
-            pct = int(done/total*100) if total else 0
-            progress2.progress(pct)
-            phase2_placeholder.text(f"Phase 2: captions {pct}% ({done}/{total})")
-            if done % max(1, total//20 or 1) == 0:
-                log_placeholder.write(f"Phase 2 progress: {done}/{total}")
-
-        if concurrent_phase2 and ollama_installed() and model_available("llava"):
-            def run_p1():
-                with st.spinner("Indexing images (Phase 1)…"):
-                    try:
-                        idx_comb, idx_clip, comb_embs, clip_embs, meta, pca_obj = phase1_index(image_paths, progress_cb=p1_cb)
-                        st.session_state.faiss_combined = idx_comb
-                        st.session_state.faiss_clip = idx_clip
-                        st.session_state.pca_obj = pca_obj
-                        st.session_state.phase1_ready = True
-                        phase1_placeholder.text("Phase 1: complete")
-                        start_watcher(folder)
-                    except Exception as exc:
-                        st.sidebar.error(f"Phase 1 error: {exc}")
-            def run_p2():
-                with st.spinner("Generating captions (Phase 2)…"):
-                    try:
-                        phase2_caption(image_paths, progress_cb=p2_cb)
-                        st.session_state.phase2_ready = True
-                        phase2_placeholder.text("Phase 2: complete")
-                    except Exception as exc:
-                        st.sidebar.error(f"Phase 2 error: {exc}")
-            threading.Thread(target=run_p1, daemon=True).start()
-            threading.Thread(target=run_p2, daemon=True).start()
-        else:
-            # Run sequentially for predictable resource usage
-            with st.spinner("Indexing images (Phase 1)…"):
-                try:
-                    idx_comb, idx_clip, comb_embs, clip_embs, meta, pca_obj = phase1_index(image_paths, progress_cb=p1_cb)
-                    st.session_state.faiss_combined = idx_comb
-                    st.session_state.faiss_clip = idx_clip
-                    st.session_state.pca_obj = pca_obj
-                    st.session_state.phase1_ready = True
-                    phase1_placeholder.text("Phase 1: complete")
-                    start_watcher(folder)
-                except Exception as exc:
-                    st.sidebar.error(f"Phase 1 error: {exc}")
-            with st.spinner("Generating captions (Phase 2)…"):
-                try:
-                    phase2_caption(image_paths, progress_cb=p2_cb)
-                    st.session_state.phase2_ready = True
-                    phase2_placeholder.text("Phase 2: complete")
-                except Exception as exc:
-                    st.sidebar.error(f"Phase 2 error: {exc}")
+    try:
+        # Launch the enqueuer script as a background process
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        st.session_state['enqueuer_process'] = process.pid
+        st.success(f"Successfully launched job enqueuer (PID: {process.pid}).")
+        st.code(" ".join(command))
+        # We don't wait for it to finish. The UI can now monitor Redis.
+    except Exception as e:
+        st.error(f"Failed to launch enqueuer script: {e}")
 
 if save_idx_btn:
     if st.session_state.faiss_combined is not None:
@@ -896,6 +614,69 @@ if save_idx_btn:
         st.success("Saved FAISS indices.")
     else:
         st.error("No index to save yet.")
+
+# Backend Monitoring
+st.sidebar.header("Backend Controls")
+st.session_state.redis_host = st.sidebar.text_input("Redis Host", value="localhost")
+st.session_state.redis_port = st.sidebar.number_input("Redis Port", value=6379)
+
+st.sidebar.header("Search Index")
+st.session_state.index_dir = st.sidebar.text_input("Index Directory", value="output")
+if st.sidebar.button("Load Index from Directory"):
+    index_dir = Path(st.session_state.index_dir)
+    try:
+        if not index_dir.exists():
+            st.error(f"Index directory not found: {index_dir}")
+        else:
+            # Load main index
+            combined_idx_path = index_dir / "combined.index"
+            if combined_idx_path.exists():
+                st.session_state.faiss_combined = faiss.read_index(str(combined_idx_path))
+                st.success("Loaded combined index.")
+            else:
+                 st.error("combined.index not found in directory.")
+
+            # Load paths
+            paths_path = index_dir / "image_paths.json"
+            if paths_path.exists():
+                with open(paths_path, "r") as f:
+                    st.session_state.index_paths = json.load(f)
+                st.success(f"Loaded {len(st.session_state.index_paths)} image paths.")
+            else:
+                st.error("image_paths.json not found in directory.")
+
+            # Load optional clip index
+            clip_idx_path = index_dir / "clip.index"
+            if clip_idx_path.exists():
+                st.session_state.faiss_clip = faiss.read_index(str(clip_idx_path))
+                st.success("Loaded CLIP index.")
+
+            # Load optional PCA matrix
+            pca_path = index_dir / "pca.matrix.pkl"
+            if pca_path.exists():
+                with open(pca_path, "rb") as f:
+                    st.session_state.pca_obj = pickle.load(f)
+                st.success("Loaded PCA matrix.")
+
+    except Exception as e:
+        st.error(f"Failed to load index files: {e}")
+
+
+st.header("Backend Monitoring")
+if st.button("Refresh Queue Stats"):
+    try:
+        r = redis.Redis(host=st.session_state.redis_host, port=st.session_state.redis_port, db=0)
+        jobs_in_queue = r.llen("forceps:job_queue")
+        results_in_queue = r.llen("forceps:results_queue")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.metric("Jobs in Queue", f"{jobs_in_queue:,}")
+        with c2:
+            st.metric("Results in Queue", f"{results_in_queue:,}")
+
+    except Exception as e:
+        st.error(f"Could not connect to Redis: {e}")
 
 # Search UI
 st.header("Search")
