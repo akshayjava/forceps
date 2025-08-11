@@ -5,14 +5,6 @@ import torch
 from transformers import AutoModel, AutoImageProcessor
 from PIL import Image
 import numpy as np
-import cv2
-try:
-    from turbojpeg import TurboJPEG
-    jpeg = TurboJPEG()
-    USE_TURBOJPEG = True
-except ImportError:
-    USE_TURBOJPEG = False
-
 
 # optional CLIP import
 try:
@@ -52,31 +44,6 @@ def load_models(vit_model_name="google/vit-base-patch16-224-in21k"):
     vit_dim = vit.config.hidden_size
     clip_dim = 512 if clip_model is not None else 0
     return vit, clip_model, preprocess_vit, preprocess_clip, vit_dim, clip_dim
-
-def preprocess_image_for_vit_clip(path, preprocess_vit, preprocess_clip):
-    try:
-        path_str = str(path)
-        im = None
-        # Fast path for JPEGs
-        if USE_TURBOJPEG and path_str.lower().endswith(('.jpg', '.jpeg')):
-            with open(path_str, 'rb') as f:
-                im = jpeg.decode(f.read(), pixel_format=turbojpeg.TJPF_RGB)
-            im = Image.fromarray(im)
-        # Fast path for other formats with OpenCV
-        elif path_str.lower().endswith(('.png', '.bmp', '.tiff')):
-            img_array = cv2.imread(path_str)
-            if img_array is not None:
-                im = Image.fromarray(cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB))
-
-        # Fallback to PIL
-        if im is None:
-            im = Image.open(path_str).convert("RGB")
-
-        vit_t = preprocess_vit(im)
-        clip_t = preprocess_clip(im) if preprocess_clip is not None else None
-        return str(path), im, vit_t, clip_t
-    except Exception:
-        return None
 
 def compute_batch_embeddings(vit_batch, clip_batch, vit_model, clip_model):
     import torch
