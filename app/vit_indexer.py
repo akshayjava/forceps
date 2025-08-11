@@ -5,6 +5,12 @@ Processes large image datasets through ViT and creates FAISS ANN index
 """
 
 import os
+# Set conservative threading and OpenMP options early to avoid libomp conflicts
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import time
 import logging
 import argparse
@@ -24,6 +30,12 @@ import gc
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Reduce FAISS thread usage to avoid OpenMP contention
+try:
+    faiss.omp_set_num_threads(1)
+except Exception:
+    pass
 
 class ImageDataset(Dataset):
     """Custom dataset for loading images from directory with optimizations"""
