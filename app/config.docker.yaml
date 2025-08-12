@@ -2,6 +2,11 @@
 # This file uses paths that are valid INSIDE the containers.
 # The docker-compose.yml file maps host directories to these paths.
 
+# Details for the specific case being processed
+case_details:
+  case_name: "docker-case"
+  case_description: "Analysis run via Docker."
+
 # Redis service name as defined in docker-compose.yml
 redis:
   host: "redis"

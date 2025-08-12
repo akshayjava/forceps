@@ -1,6 +1,12 @@
 # FORCEPS Configuration File
 # Copy this file to config.yaml and edit as needed.
 
+# Details for the specific case being processed
+case_details:
+  case_name: "my-first-case"
+  # Optional description for reports
+  case_description: "Initial analysis of evidence drive X."
+
 # Redis connection details for the job queue
 redis:
   host: "localhost"
