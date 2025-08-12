@@ -12,40 +12,45 @@ import yaml
 from pathlib import Path
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from app.hashers import get_hashers
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# This function is copied from engine.py to make the script self-contained
-def scan_images(root_dir: str, max_workers: int) -> list[str]:
-    logger.info(f"Starting parallel scan in '{root_dir}' with {max_workers} workers.")
+def process_file(file_path, hashers):
+    """Process a single file: find it, and compute all configured hashes."""
+    try:
+        all_hashes = {}
+        for hasher in hashers:
+            all_hashes.update(hasher.compute(file_path))
+        return {"path": str(file_path), "hashes": all_hashes}
+    except Exception as e:
+        logger.warning(f"Could not process file {file_path}: {e}")
+        return None
+
+def discover_and_process_files(root_dir: str, hashers: list, max_workers: int) -> list[dict]:
+    logger.info(f"Starting parallel file discovery and processing in '{root_dir}'...")
     image_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".webp"}
-    image_paths = []
 
-    def scan_subdirectory(directory):
-        sub_paths = []
-        try:
-            for entry in os.scandir(directory):
-                if entry.is_file() and Path(entry.name).suffix.lower() in image_extensions:
-                    sub_paths.append(entry.path)
-        except (PermissionError, FileNotFoundError):
-            logger.warning(f"Could not access directory: {directory}")
-        return sub_paths
-
+    # Use a ThreadPoolExecutor to parallelize both walking and processing
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = []
-        for root, _, _ in os.walk(root_dir):
-            futures.append(executor.submit(scan_subdirectory, root))
+        for root, _, files in os.walk(root_dir):
+            for filename in files:
+                if Path(filename).suffix.lower() in image_extensions:
+                    file_path = Path(root) / filename
+                    futures.append(executor.submit(process_file, file_path, hashers))
 
+        results = []
         for i, future in enumerate(as_completed(futures)):
             if (i + 1) % 1000 == 0:
-                logger.info(f"Scanned {i + 1} directories...")
-            image_paths.extend(future.result())
+                logger.info(f"Processed {i + 1} files...")
+            result = future.result()
+            if result:
+                results.append(result)
 
-    seen = set()
-    unique_paths = [p for p in image_paths if not (p in seen or seen.add(p))]
-    return unique_paths
+    return results
 
 def main():
     parser = argparse.ArgumentParser(description="FORCEPS Job Enqueuer")
@@ -65,9 +70,16 @@ def main():
     cfg_redis = config['redis']
     cfg_data = config['data']
     cfg_perf = config['performance']['enqueuer']
+    cfg_hashing = config.get('hashing', [])
 
     logger.info("--- FORCEPS Job Enqueuer ---")
 
+    # 1. Initialize hashers from config
+    hashers = get_hashers(cfg_hashing)
+    if not hashers:
+        logger.warning("No hashers configured. No hashes will be computed.")
+
+    # 2. Connect to Redis
     try:
         r = redis.Redis(host=cfg_redis['host'], port=cfg_redis['port'], db=0, decode_responses=True)
         r.ping()
@@ -76,18 +88,18 @@ def main():
         logger.error(f"Could not connect to Redis: {e}")
         return
 
-    # Scan for images
-    image_paths = scan_images(cfg_data['input_dir'], cfg_perf['scan_max_workers'])
-    logger.info(f"Found {len(image_paths)} total images.")
+    # 3. Scan for images and compute their hashes
+    image_data = discover_and_process_files(cfg_data['input_dir'], hashers, cfg_perf['scan_max_workers'])
+    logger.info(f"Found and processed {len(image_data)} total images.")
 
-    # Enqueue jobs in batches
+    # 4. Enqueue jobs in batches
     jobs_enqueued = 0
-    for i in range(0, len(image_paths), cfg_perf['job_batch_size']):
-        batch = image_paths[i:i + cfg_perf['job_batch_size']]
+    for i in range(0, len(image_data), cfg_perf['job_batch_size']):
+        batch = image_data[i:i + cfg_perf['job_batch_size']]
         r.rpush(cfg_redis['job_queue'], json.dumps(batch))
         jobs_enqueued += 1
 
-    logger.info(f"Enqueued {jobs_enqueued} jobs with a total of {len(image_paths)} images to queue '{cfg_redis['job_queue']}'.")
+    logger.info(f"Enqueued {jobs_enqueued} jobs with a total of {len(image_data)} images to queue '{cfg_redis['job_queue']}'.")
     logger.info("--- Enqueueing complete ---")
 
 if __name__ == "__main__":

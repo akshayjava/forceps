@@ -126,13 +126,13 @@ def main():
 
     # 2. Prepare data for FAISS
     logger.info("Preparing data for indexing...")
-    paths = [res["path"] for res in all_results]
+    manifest_data = [{"path": res["path"], "hashes": res.get("hashes")} for res in all_results]
     combined_embs = np.array([res["combined_emb"] for res in all_results], dtype=np.float32)
 
     has_clip = "clip_emb" in all_results[0]
     clip_embs = None
     if has_clip:
-        clip_embs = np.array([res["clip_emb"] for res in all_results], dtype=np.float32)
+        clip_embs = np.array([res["clip_emb"] for res in all_results if "clip_emb" in res], dtype=np.float32)
 
     n, d_comb = combined_embs.shape
 
@@ -145,7 +145,7 @@ def main():
         index_clip, _ = build_index_for_embeddings(clip_embs, d_clip, n, faiss_args)
 
     # 4. Save results
-    logger.info("Saving final FAISS indexes, PCA matrix, and path mapping...")
+    logger.info("Saving final FAISS indexes, PCA matrix, and manifest...")
     output_dir = Path(cfg_data['output_dir'])
     output_dir.mkdir(exist_ok=True)
 
@@ -155,8 +155,8 @@ def main():
     if pca_matrix:
         with open(output_dir / "pca.matrix.pkl", "wb") as f:
             pickle.dump(pca_matrix, f)
-    with open(output_dir / "image_paths.json", "w") as f:
-        json.dump(paths, f)
+    with open(output_dir / "manifest.json", "w") as f:
+        json.dump(manifest_data, f, indent=2)
 
     logger.info("--- Index building complete ---")
 

@@ -6,6 +6,7 @@ import json
 import csv
 import io
 import time
+import abc
 from pathlib import Path
 from typing import Dict, Any, List
 from PIL import Image
@@ -24,6 +25,22 @@ except Exception:
 CACHE_DIR = Path("./cache")
 CACHE_DIR.mkdir(exist_ok=True)
 BOOKMARKS_FILE = CACHE_DIR / "bookmarks.json"
+
+class Hasher(abc.ABC):
+    """Abstract base class for all hashers."""
+    @abc.abstractmethod
+    def compute(self, filepath: Path) -> Dict[str, Any]:
+        """
+        Compute hashes for a given file.
+
+        Args:
+            filepath: Path to the file.
+
+        Returns:
+            A dictionary where keys are hash names (e.g., "sha256")
+            and values are the computed hash values.
+        """
+        pass
 
 def is_image_file(p: Path):
     try:
@@ -62,13 +79,6 @@ def save_cache(fp: str, obj: dict):
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "w") as f:
         json.dump(obj, f)
-
-def compute_perceptual_hashes(path: Path):
-    try:
-        im = Image.open(path).convert("RGB")
-        return {"phash": str(imagehash.phash(im)), "ahash": str(imagehash.average_hash(im)), "dhash": str(imagehash.dhash(im))}
-    except Exception:
-        return {"phash": None, "ahash": None, "dhash": None}
 
 def read_exif(path: Path):
     try:

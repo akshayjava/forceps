@@ -636,14 +636,16 @@ if st.sidebar.button("Load Index from Directory"):
             else:
                  st.error("combined.index not found in directory.")
 
-            # Load paths
-            paths_path = index_dir / "image_paths.json"
-            if paths_path.exists():
-                with open(paths_path, "r") as f:
-                    st.session_state.index_paths = json.load(f)
-                st.success(f"Loaded {len(st.session_state.index_paths)} image paths.")
+            # Load manifest
+            manifest_path = index_dir / "manifest.json"
+            if manifest_path.exists():
+                with open(manifest_path, "r") as f:
+                    manifest_data = json.load(f)
+                st.session_state.manifest = {item['path']: item for item in manifest_data}
+                st.session_state.index_paths = list(st.session_state.manifest.keys())
+                st.success(f"Loaded manifest for {len(st.session_state.index_paths)} images.")
             else:
-                st.error("image_paths.json not found in directory.")
+                st.error("manifest.json not found in directory.")
 
             # Load optional clip index
             clip_idx_path = index_dir / "clip.index"
@@ -876,6 +878,15 @@ if display_results:
             </div>
             """, unsafe_allow_html=True)
             tile.caption(Path(r).name)
+
+            # Display hashes if manifest is loaded
+            if 'manifest' in st.session_state and r in st.session_state.manifest:
+                hashes = st.session_state.manifest[r].get('hashes', {})
+                if hashes:
+                    for hash_name, hash_value in hashes.items():
+                        if hash_value:
+                            tile.code(f"{hash_name.upper()}: {hash_value[:16]}...")
+
             meta = load_cache(fingerprint(Path(r)))
             if meta and meta.get("metadata", {}).get("caption"):
                 tile.write(meta["metadata"]["caption"][:140])

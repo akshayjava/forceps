@@ -2,18 +2,15 @@
 set -e
 echo "=== FORCEPS Installer ==="
 
-ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-PY=${PYTHON:-python3}
-VENV="$ROOT_DIR/venv_forceps"
+echo "Installing dependencies for the current user."
+echo "Step 1: Installing CPU-only PyTorch to save space..."
 
-if [ ! -d "$VENV" ]; then
-  "$PY" -m venv "$VENV"
-fi
-source "$VENV/bin/activate"
-pip install --upgrade pip
-pip install -r "$ROOT_DIR/app/requirements.txt"
+python3 -m pip install --user --upgrade pip
+python3 -m pip install --user --index-url https://download.pytorch.org/whl/cpu torch torchvision
+
+echo "Step 2: Installing remaining dependencies..."
+python3 -m pip install --user -r "app/requirements.txt"
 
 echo "Installation complete."
-echo "Activate environment and run:"
-echo "  source $VENV/bin/activate"
-echo "  PYTHONPATH=$ROOT_DIR streamlit run $ROOT_DIR/app/main.py"
+echo "Dependencies installed in the user's site-packages."
+echo "Ensure ~/.local/bin is in your PATH to run installed scripts."

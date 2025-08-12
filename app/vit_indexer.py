@@ -5,12 +5,6 @@ Processes large image datasets through ViT and creates FAISS ANN index
 """
 
 import os
-# Set conservative threading and OpenMP options early to avoid libomp conflicts
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import time
 import logging
 import argparse
@@ -30,12 +24,6 @@ import gc
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-# Reduce FAISS thread usage to avoid OpenMP contention
-try:
-    faiss.omp_set_num_threads(1)
-except Exception:
-    pass
 
 class ImageDataset(Dataset):
     """Custom dataset for loading images from directory with optimizations"""
@@ -191,19 +179,6 @@ class ViTIndexer:
             
             with context_manager:
                 for batch_idx, (batch_images, batch_paths) in enumerate(tqdm(dataloader, desc="Extracting features")):
-                    # Skip dummy/failed images: filter zero tensors
-                    # Compute validity mask (non-zero sum per sample)
-                    with torch.no_grad():
-                        per_sample_sum = batch_images.view(batch_images.size(0), -1).abs().sum(dim=1)
-                        valid_mask = per_sample_sum > 0
-                    if valid_mask.sum() == 0:
-                        continue
-
-                    if valid_mask.sum() < batch_images.size(0):
-                        # Filter both images and paths
-                        batch_images = batch_images[valid_mask]
-                        batch_paths = [p for p, m in zip(batch_paths, valid_mask.tolist()) if m]
-
                     batch_images = batch_images.to(self.device, non_blocking=True)
                     
                     # Get ViT features (using CLS token)
@@ -385,30 +360,24 @@ from tqdm import tqdm
 import psutil
 import gc
 import cv2
+import turbojpeg
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import multiprocessing as mp
 from functools import lru_cache
 
-# Optional TurboJPEG support
-try:
-    import turbojpeg  # type: ignore
-    try:
-        jpeg = turbojpeg.TurboJPEG()
-        USE_TURBOJPEG = True
-        logger.info("Using TurboJPEG for faster image decoding")
-    except Exception:
-        USE_TURBOJPEG = False
-        logger.info("TurboJPEG not available, using PIL")
-except Exception:
-    USE_TURBOJPEG = False
-    logger.info("TurboJPEG not available, using PIL")
-
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Global TurboJPEG decoder configured above if available
+# Global TurboJPEG decoder for faster JPEG decoding
+try:
+    jpeg = turbojpeg.TurboJPEG()
+    USE_TURBOJPEG = True
+    logger.info("Using TurboJPEG for faster image decoding")
+except ImportError:
+    USE_TURBOJPEG = False
+    logger.info("TurboJPEG not available, using PIL")
 
 class OptimizedImageDataset(Dataset):
     """Ultra-optimized dataset with advanced preprocessing"""
@@ -935,7 +904,7 @@ def estimate_processing_time():
     print(f"  • Use NVMe RAID 0 for I/O bottleneck")
     print(f"  • Consider ONNX + TensorRT for 3-5x speedup")
     print(f"  • Model quantization: INT8 for 2-4x with quality loss")
-    print(f"  • Distributed processing across multiple nodes")
+    print(f"  • Distributed processing across multiple nodes") kernels for fixed input sizes")
     print(f"  ✓ Optimized DataLoader: More workers, prefetching, pin_memory")
     print(f"  ✓ Memory Management: Less frequent cache clearing")
     
@@ -964,8 +933,15 @@ def main():
                        help='Use torch.compile for model optimization')
     parser.add_argument('--disable_optimizations', action='store_true',
                        help='Disable all performance optimizations')
+
     parser.add_argument('--estimate', action='store_true', 
                        help='Show processing time estimates and exit')
+    parser.add_argument('--use_fp16', action='store_true', default=True,
+                       help='Use half precision for faster inference')
+    parser.add_argument('--compile_model', action='store_true', default=True,
+                       help='Use torch.compile for model optimization')
+    parser.add_argument('--disable_optimizations', action='store_true',
+                       help='Disable all performance optimizations')
     
     args = parser.parse_args()
     

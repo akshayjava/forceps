@@ -40,6 +40,12 @@ performance:
     train_samples: 5000
     add_batch: 8192
 
+# Hashing algorithms to run on each file.
+# Available by default: "sha256", "perceptual"
+hashing:
+  - "sha256"
+  - "perceptual"
+
 # Feature flags
 features:
   # Enable captioning (Note: requires a separate captioning worker, not yet implemented)
