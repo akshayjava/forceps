@@ -19,10 +19,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from app.embeddings import (
     load_models,
     compute_batch_embeddings,
-    preprocess_image_for_vit_clip,
 )
 from app.utils import (
-    is_image_file,
     fingerprint,
     load_cache,
     save_cache,
@@ -33,6 +31,7 @@ from app.llm_ollama import ollama_installed, generate_caption_ollama, model_avai
 from torch.utils.data import Dataset
 import torch
 import cv2
+from PIL import Image
 try:
     from turbojpeg import TurboJPEG
     jpeg = TurboJPEG()
