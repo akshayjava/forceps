@@ -620,48 +620,67 @@ st.sidebar.header("Backend Controls")
 st.session_state.redis_host = st.sidebar.text_input("Redis Host", value="localhost")
 st.session_state.redis_port = st.sidebar.number_input("Redis Port", value=6379)
 
-st.sidebar.header("Search Index")
-st.session_state.index_dir = st.sidebar.text_input("Index Directory", value="output")
-if st.sidebar.button("Load Index from Directory"):
-    index_dir = Path(st.session_state.index_dir)
-    try:
-        if not index_dir.exists():
-            st.error(f"Index directory not found: {index_dir}")
-        else:
-            # Load main index
-            combined_idx_path = index_dir / "combined.index"
-            if combined_idx_path.exists():
-                st.session_state.faiss_combined = faiss.read_index(str(combined_idx_path))
-                st.success("Loaded combined index.")
+st.sidebar.header("Load Case for Searching")
+cases_dir_path = st.sidebar.text_input("Cases Directory", value="output_index")
+st.session_state.cases_dir = cases_dir_path
+
+case_options = []
+try:
+    p = Path(cases_dir_path)
+    if p.is_dir():
+        case_options = sorted([d.name for d in p.iterdir() if d.is_dir()], reverse=True)
+except Exception as e:
+    st.sidebar.error(f"Error scanning cases: {e}")
+
+if not case_options:
+    st.sidebar.caption("No cases found in directory.")
+else:
+    selected_case = st.sidebar.selectbox("Select Case to Load", case_options)
+    st.session_state.selected_case = selected_case
+
+    if st.sidebar.button("Load Selected Case"):
+        index_dir = Path(st.session_state.cases_dir) / st.session_state.selected_case
+        st.sidebar.info(f"Loading from: {index_dir}")
+        try:
+            if not index_dir.is_dir():
+                st.error(f"Case directory not found: {index_dir}")
             else:
-                 st.error("combined.index not found in directory.")
+                # Load main index
+                combined_idx_path = index_dir / "combined.index"
+                if combined_idx_path.exists():
+                    st.session_state.faiss_combined = faiss.read_index(str(combined_idx_path))
+                    st.success("Loaded combined index.")
+                else:
+                     st.error("combined.index not found in directory.")
 
-            # Load manifest
-            manifest_path = index_dir / "manifest.json"
-            if manifest_path.exists():
-                with open(manifest_path, "r") as f:
-                    manifest_data = json.load(f)
-                st.session_state.manifest = {item['path']: item for item in manifest_data}
-                st.session_state.index_paths = list(st.session_state.manifest.keys())
-                st.success(f"Loaded manifest for {len(st.session_state.index_paths)} images.")
-            else:
-                st.error("manifest.json not found in directory.")
+                # Load manifest
+                manifest_path = index_dir / "manifest.json"
+                if manifest_path.exists():
+                    with open(manifest_path, "r") as f:
+                        manifest_data = json.load(f)
+                    # Create a map for easy lookup
+                    st.session_state.manifest = {item['path']: item for item in manifest_data}
+                    # Keep the ordered list of paths for indexing
+                    st.session_state.index_paths = [item['path'] for item in manifest_data]
+                    st.success(f"Loaded manifest for {len(st.session_state.index_paths)} images.")
+                else:
+                    st.error("manifest.json not found in directory.")
 
-            # Load optional clip index
-            clip_idx_path = index_dir / "clip.index"
-            if clip_idx_path.exists():
-                st.session_state.faiss_clip = faiss.read_index(str(clip_idx_path))
-                st.success("Loaded CLIP index.")
+                # Load optional clip index
+                clip_idx_path = index_dir / "clip.index"
+                if clip_idx_path.exists():
+                    st.session_state.faiss_clip = faiss.read_index(str(clip_idx_path))
+                    st.success("Loaded CLIP index.")
 
-            # Load optional PCA matrix
-            pca_path = index_dir / "pca.matrix.pkl"
-            if pca_path.exists():
-                with open(pca_path, "rb") as f:
-                    st.session_state.pca_obj = pickle.load(f)
-                st.success("Loaded PCA matrix.")
+                # Load optional PCA matrix
+                pca_path = index_dir / "pca.matrix.pkl"
+                if pca_path.exists():
+                    with open(pca_path, "rb") as f:
+                        st.session_state.pca_obj = pickle.load(f)
+                    st.success("Loaded PCA matrix.")
 
-    except Exception as e:
-        st.error(f"Failed to load index files: {e}")
+        except Exception as e:
+            st.error(f"Failed to load index files: {e}")
 
 
 st.header("Backend Monitoring")

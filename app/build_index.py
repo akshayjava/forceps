@@ -84,11 +84,13 @@ def main():
     cfg_redis = config['redis']
     cfg_data = config['data']
     cfg_faiss = config['performance']['faiss']
+    cfg_case = config.get('case_details', {'case_name': f'case_{int(time.time())}'})
 
     # Create a simple namespace object for the build_index_for_embeddings function
     faiss_args = argparse.Namespace(**cfg_faiss)
 
     logger.info("--- FORCEPS Index Builder Starting ---")
+    logger.info(f"Case Name: {cfg_case.get('case_name')}")
 
     try:
         r = redis.Redis(host=cfg_redis['host'], port=cfg_redis['port'], db=0)
@@ -144,21 +146,22 @@ def main():
         _, d_clip = clip_embs.shape
         index_clip, _ = build_index_for_embeddings(clip_embs, d_clip, n, faiss_args)
 
-    # 4. Save results
+    # 4. Save results to case-specific directory
     logger.info("Saving final FAISS indexes, PCA matrix, and manifest...")
-    output_dir = Path(cfg_data['output_dir'])
-    output_dir.mkdir(exist_ok=True)
+    base_output_dir = Path(cfg_data['output_dir'])
+    case_output_dir = base_output_dir / cfg_case['case_name']
+    case_output_dir.mkdir(parents=True, exist_ok=True)
 
-    faiss.write_index(index_comb, str(output_dir / "combined.index"))
+    faiss.write_index(index_comb, str(case_output_dir / "combined.index"))
     if index_clip:
-        faiss.write_index(index_clip, str(output_dir / "clip.index"))
+        faiss.write_index(index_clip, str(case_output_dir / "clip.index"))
     if pca_matrix:
-        with open(output_dir / "pca.matrix.pkl", "wb") as f:
+        with open(case_output_dir / "pca.matrix.pkl", "wb") as f:
             pickle.dump(pca_matrix, f)
-    with open(output_dir / "manifest.json", "w") as f:
+    with open(case_output_dir / "manifest.json", "w") as f:
         json.dump(manifest_data, f, indent=2)
 
-    logger.info("--- Index building complete ---")
+    logger.info(f"--- Index building complete for case '{cfg_case['case_name']}' ---")
 
 if __name__ == "__main__":
     main()
