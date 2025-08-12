@@ -133,58 +133,81 @@ def _gather_metadata_for_path(path: Path) -> Dict[str, Any]:
         "path": str(path),
         "filename": path.name,
     }
+    # Try to get hashes from manifest if available (Streamlit context)
+    try:
+        import streamlit as st
+        if 'manifest' in st.session_state and str(path) in st.session_state.manifest:
+            info.update(st.session_state.manifest[str(path)].get("hashes", {}))
+    except (ImportError, AttributeError):
+        pass # Not in a streamlit context
+
     try:
         fp = fingerprint(path)
         cached = load_cache(fp) or {}
         md = cached.get("metadata", {}) if isinstance(cached, dict) else {}
     except Exception:
         md = {}
+
     if not md:
-        # compute on-demand
-        md = {
-            "exif": read_exif(path),
-            "hashes": compute_perceptual_hashes(path),
-        }
+        # compute on-demand if cache is missing
+        md = {"exif": read_exif(path)}
+
     exif = md.get("exif", {}) or {}
     dt = exif.get("DateTime")
     if isinstance(dt, tuple) or isinstance(dt, list):
-        # Not expected; convert to string
         dt_str = str(dt)
     elif dt is None:
         dt_str = ""
     else:
         try:
-            # dt is time.struct_time
-            dt_str = time.strftime("%Y-%m-%d %H:%M:%S", dt)  # type: ignore[arg-type]
+            dt_str = time.strftime("%Y-%m-%d %H:%M:%S", dt)
         except Exception:
             dt_str = str(dt)
-    hashes = md.get("hashes", {}) or {}
+
     info.update({
         "make": exif.get("Make", ""),
         "model": exif.get("Model", ""),
         "datetime": dt_str,
-        "phash": hashes.get("phash") or "",
-        "ahash": hashes.get("ahash") or "",
-        "dhash": hashes.get("dhash") or "",
         "caption": (md.get("caption") or ""),
     })
     return info
 
 def generate_bookmarks_csv(bookmarks: Dict[str, Dict[str, Any]]) -> bytes:
     """Create CSV bytes for current bookmarks with metadata and tags."""
+    if not bookmarks:
+        return b""
+
     output = io.StringIO(newline="")
-    fields = [
-        "path", "filename", "make", "model", "datetime",
-        "phash", "ahash", "dhash", "caption", "tags",
-    ]
+
+    # Dynamically determine headers from the first bookmark's metadata
+    first_path = next(iter(bookmarks.keys()))
+    first_row = _gather_metadata_for_path(Path(first_path))
+
+    base_fields = ["path", "filename", "make", "model", "datetime", "caption"]
+    hash_fields = sorted(list(first_row.get("hashes", {}).keys()))
+    bookmark_fields = ["tags", "notes", "bookmarked_at"]
+
+    fields = base_fields + hash_fields + bookmark_fields
     writer = csv.DictWriter(output, fieldnames=fields)
     writer.writeheader()
+
     for path_str, meta in bookmarks.items():
         p = Path(path_str)
         row = _gather_metadata_for_path(p)
+
+        # Flatten hashes
+        row.update(row.pop("hashes", {}))
+
+        # Add bookmark-specific data
         tags: List[str] = [t for t in (meta.get("tags") or []) if t]
         row["tags"] = "; ".join(tags)
-        writer.writerow(row)
+        row["notes"] = meta.get("notes", "")
+        row["bookmarked_at"] = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(meta.get("added_ts")))
+
+        # Ensure all fields are present
+        final_row = {f: row.get(f, "") for f in fields}
+        writer.writerow(final_row)
+
     return output.getvalue().encode("utf-8")
 
 def generate_bookmarks_pdf(bookmarks: Dict[str, Dict[str, Any]]) -> bytes:
@@ -220,16 +243,38 @@ def generate_bookmarks_pdf(bookmarks: Dict[str, Dict[str, Any]]) -> bytes:
             pass
 
         # Metadata block
-        lines = [
-            f"Path: {rec['path']}",
-            f"Make/Model: {rec['make']} / {rec['model']}",
-            f"Date/Time: {rec['datetime']}",
-            f"Hashes: phash={rec['phash']} ahash={rec['ahash']} dhash={rec['dhash']}",
-            f"Tags: {'; '.join(tags) if tags else ''}",
-            f"Caption: {rec['caption']}",
-        ]
-        for ln in lines:
-            pdf.multi_cell(0, 5, ln)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(0, 6, "Path", ln=1)
+        pdf.set_font("Helvetica", size=8)
+        pdf.multi_cell(0, 5, rec['path'])
+
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(0, 6, "Hashes", ln=1)
+        pdf.set_font("Helvetica", size=8)
+        for hash_name, hash_value in rec.get("hashes", {}).items():
+            pdf.multi_cell(0, 5, f"{hash_name.upper()}: {hash_value}")
+
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(0, 6, "Metadata", ln=1)
+        pdf.set_font("Helvetica", size=8)
+        pdf.multi_cell(0, 5, f"Make/Model: {rec['make']} / {rec['model']}")
+        pdf.multi_cell(0, 5, f"Date/Time: {rec['datetime']}")
+
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(0, 6, "Tags", ln=1)
+        pdf.set_font("Helvetica", size=8)
+        pdf.multi_cell(0, 5, '; '.join(tags) if tags else "N/A")
+
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(0, 6, "Notes", ln=1)
+        pdf.set_font("Helvetica", size=8)
+        pdf.multi_cell(0, 5, meta.get("notes") or "N/A")
+
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(0, 6, "AI Caption", ln=1)
+        pdf.set_font("Helvetica", size=8)
+        pdf.multi_cell(0, 5, rec.get("caption") or "N/A")
+
         pdf.ln(2)
 
     out = pdf.output(dest="S").encode("latin1")

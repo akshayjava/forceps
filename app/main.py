@@ -900,63 +900,65 @@ if display_results:
 
             # Display hashes if manifest is loaded
             if 'manifest' in st.session_state and r in st.session_state.manifest:
-                hashes = st.session_state.manifest[r].get('hashes', {})
-                if hashes:
-                    for hash_name, hash_value in hashes.items():
-                        if hash_value:
-                            tile.code(f"{hash_name.upper()}: {hash_value[:16]}...")
+                with tile.expander("Show Details"):
+                    # Get all data for the item
+                    manifest_item = st.session_state.manifest[r]
+                    cached_meta = load_cache(fingerprint(Path(r))) or {}
 
-            meta = load_cache(fingerprint(Path(r)))
-            if meta and meta.get("metadata", {}).get("caption"):
-                tile.write(meta["metadata"]["caption"][:140])
+                    st.code(manifest_item['path'], language='text')
+
+                    st.markdown("**Hashes**")
+                    hashes = manifest_item.get('hashes', {})
+                    if hashes:
+                        for hash_name, hash_value in hashes.items():
+                            st.text(f"{hash_name.upper()}: {hash_value}")
+
+                    st.markdown("**EXIF Data**")
+                    exif_data = cached_meta.get("metadata", {}).get("exif", {})
+                    if exif_data:
+                        for key, value in exif_data.items():
+                            st.text(f"{key}: {value}")
+
+                    st.markdown("**AI Caption**")
+                    caption = cached_meta.get("metadata", {}).get("caption")
+                    st.text(caption or "Not available.")
 
             # --- Bookmark/Tags controls ---
             def _is_bm(pth: str) -> bool:
                 return pth in (st.session_state.bookmarks or {})
-            def _add_bm(pth: str):
-                if pth not in st.session_state.bookmarks:
-                    st.session_state.bookmarks[pth] = {"tags": [], "added_ts": time.time()}
-                    save_bookmarks(st.session_state.bookmarks)
-            def _remove_bm(pth: str):
-                if pth in st.session_state.bookmarks:
-                    st.session_state.bookmarks.pop(pth, None)
-                    save_bookmarks(st.session_state.bookmarks)
-            def _update_tags(pth: str, tags_str: str):
-                tags = [t.strip() for t in (tags_str or "").replace(";", ",").split(",") if t.strip()]
-                if pth not in st.session_state.bookmarks:
-                    st.session_state.bookmarks[pth] = {"tags": tags, "added_ts": time.time()}
-                else:
-                    st.session_state.bookmarks[pth]["tags"] = tags
-                save_bookmarks(st.session_state.bookmarks)
 
-            tg_key = f"bm_tags_{r}"
-            is_bm_now = _is_bm(r)
-            # Overlay bookmark icon (visual)
-            toggle_param = "add_bm" if not is_bm_now else "remove_bm"
-            class_suffix = " active" if is_bm_now else ""
-            star_text = "★" if is_bm_now else "☆"
-            tile.markdown(
-                f"<div class='bm-overlay'><span class='bm-icon{class_suffix}'>{star_text}</span></div>",
-                unsafe_allow_html=True,
-            )
-            # Reliable Streamlit toggle button
-            bm_btn_key = f"bm_btn_{r}"
-            if tile.button(("Unbookmark ★" if is_bm_now else "Bookmark ☆"), key=bm_btn_key):
-                if is_bm_now:
-                    _remove_bm(r)
-                    is_bm_now = False
-                else:
-                    _add_bm(r)
-                    is_bm_now = True
-            if is_bm_now:
-                existing_tags = ", ".join(st.session_state.bookmarks.get(r, {}).get("tags", []))
-                new_tags = tile.text_input("Add/edit tags", value=existing_tags, key=tg_key, help="Comma or semicolon separated tags")
-                if new_tags != existing_tags:
-                    _update_tags(r, new_tags)
-                chips = st.session_state.bookmarks.get(r, {}).get("tags", [])
-                if chips:
-                    chip_html = " ".join([f"<span class='tag-chip'>{c}</span>" for c in chips])
-                    tile.markdown(chip_html, unsafe_allow_html=True)
+            with tile.expander("Manage Bookmark"):
+                is_bookmarked = _is_bm(r)
+
+                if st.checkbox("Bookmarked", value=is_bookmarked, key=f"bm_check_{r}"):
+                    # If it wasn't bookmarked before, add it now.
+                    if not is_bookmarked:
+                        st.session_state.bookmarks[r] = st.session_state.bookmarks.get(r, {"tags": [], "notes": "", "added_ts": time.time()})
+                        save_bookmarks(st.session_state.bookmarks)
+                        st.rerun() # Rerun to show the edit fields
+
+                    bookmark_data = st.session_state.bookmarks.get(r, {})
+
+                    # Tags editor
+                    existing_tags = "\n".join(bookmark_data.get("tags", []))
+                    new_tags_str = st.text_area("Tags (one per line)", value=existing_tags, key=f"tags_{r}")
+
+                    # Notes editor
+                    existing_notes = bookmark_data.get("notes", "")
+                    new_notes = st.text_area("Notes", value=existing_notes, key=f"notes_{r}")
+
+                    if st.button("Save Bookmark Details", key=f"save_bm_{r}"):
+                        new_tags = [t.strip() for t in new_tags_str.split("\n") if t.strip()]
+                        st.session_state.bookmarks[r]['tags'] = new_tags
+                        st.session_state.bookmarks[r]['notes'] = new_notes
+                        save_bookmarks(st.session_state.bookmarks)
+                        st.success("Bookmark updated!")
+
+                # If it was bookmarked but the box is now unchecked
+                elif is_bookmarked:
+                    st.session_state.bookmarks.pop(r, None)
+                    save_bookmarks(st.session_state.bookmarks)
+                    st.rerun()
 
             # --- Info overlay rendering remains, but no explicit button ---
             info_state_key = f"info_state_{r}"
