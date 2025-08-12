@@ -93,14 +93,18 @@ def collate_fn(batch):
 
     return vit_tensors, clip_tensors, paths
 
-def compute_embeddings_for_job(image_paths, models, args):
-    logger.info(f"Processing job of {len(image_paths)} images with ONNX runtime.")
+def compute_embeddings_for_job(image_job_data, models, args):
+    logger.info(f"Processing job of {len(image_job_data)} images with ONNX runtime.")
 
     vit_session = models["vit_session"]
     clip_session = models["clip_session"]
     preprocess_vit = models["preprocess_vit"]
     preprocess_clip = models["preprocess_clip"]
     clip_dim = models["clip_dim"]
+
+    # Unpack paths and hashes from the job data
+    image_paths = [item['path'] for item in image_job_data]
+    path_to_hashes = {item['path']: item['hashes'] for item in image_job_data}
 
     dataset = ForcepsDataset(image_paths, preprocess_vit, preprocess_clip)
     dataloader = torch.utils.data.DataLoader(
@@ -138,7 +142,11 @@ def compute_embeddings_for_job(image_paths, models, args):
 
         # Append results
         for i, path in enumerate(paths):
-            result = {"path": path, "combined_emb": combined_batch[i].tolist()}
+            result = {
+                "path": path,
+                "hashes": path_to_hashes.get(path),
+                "combined_emb": combined_batch[i].tolist()
+            }
             if clip_dim > 0 and emb_clip is not None:
                 result["clip_emb"] = emb_clip[i].tolist()
             results.append(result)
@@ -245,11 +253,11 @@ def main():
     while True:
         try:
             _, job_data = r.blpop(cfg_redis['job_queue'])
-            image_paths = json.loads(job_data)
+            image_job_data = json.loads(job_data)
 
-            logger.info(f"Received job with {len(image_paths)} images.")
+            logger.info(f"Received job with {len(image_job_data)} images.")
 
-            results = compute_embeddings_for_job(image_paths, models, worker_args)
+            results = compute_embeddings_for_job(image_job_data, models, worker_args)
 
             if results:
                 r.rpush(cfg_redis['results_queue'], json.dumps(results))

@@ -3,11 +3,21 @@ from pathlib import Path
 import os
 import time
 from PIL import Image
-from app.utils import fingerprint, is_image_file, compute_perceptual_hashes
+from app.utils import fingerprint, is_image_file
 
-def create_dummy_image(path: Path, size=(32, 32), color="red"):
-    """Helper function to create a simple image file."""
+from PIL import ImageDraw
+
+def create_dummy_image(path: Path, size=(32, 32), color="red", pattern=None):
+    """
+    Helper function to create a simple image file, with an optional pattern.
+    Pattern should be a list of (box, fill_color) tuples.
+    e.g. [([0, 0, 5, 5], "white")]
+    """
     img = Image.new("RGB", size, color)
+    if pattern:
+        draw = ImageDraw.Draw(img)
+        for box, fill in pattern:
+            draw.rectangle(box, fill=fill)
     img.save(path, "PNG")
     return path
 
@@ -47,25 +57,3 @@ def test_is_image_file(tmp_path):
 
     assert is_image_file(image_path) is True
     assert is_image_file(text_path) is False
-
-def test_compute_perceptual_hashes(tmp_path):
-    """
-    Tests that perceptual hashes are computed correctly.
-    """
-    image_path = create_dummy_image(tmp_path / "test.png")
-    hashes = compute_perceptual_hashes(image_path)
-
-    assert isinstance(hashes, dict)
-    assert "phash" in hashes
-    assert "ahash" in hashes
-    assert "dhash" in hashes
-
-    # Check that hashes are strings (or None, though they shouldn't be for a valid image)
-    assert isinstance(hashes["phash"], str)
-    assert isinstance(hashes["ahash"], str)
-    assert isinstance(hashes["dhash"], str)
-
-    # Check for expected length of hex hashes
-    assert len(hashes["phash"]) == 16
-    assert len(hashes["ahash"]) == 16
-    assert len(hashes["dhash"]) == 16

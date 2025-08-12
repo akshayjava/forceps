@@ -1,4 +1,5 @@
 # Large and generated files
+app/demo_images/
 cache/
 build/
 dist/
