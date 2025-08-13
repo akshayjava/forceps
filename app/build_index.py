@@ -15,10 +15,23 @@ import faiss
 import pickle
 from pathlib import Path
 import time
+from app.utils import load_cache, fingerprint
+from whoosh.index import create_in
+from whoosh.fields import Schema, TEXT, ID
+from whoosh.analysis import StemmingAnalyzer
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Define the schema for the text index.
+# We'll store the path as a unique ID to link back to the FAISS index.
+# All searchable text will be combined into a single 'content' field for simplicity.
+schema = Schema(
+    path=ID(stored=True, unique=True),
+    content=TEXT(analyzer=StemmingAnalyzer(), stored=False)
+)
+
 
 def build_index_for_embeddings(embeddings, d, n, args):
     """Builds a FAISS index for a given set of embeddings."""
@@ -138,18 +151,43 @@ def main():
 
     n, d_comb = combined_embs.shape
 
-    # 3. Build indexes
+    # 3. Build Vector Index (FAISS)
+    logger.info("Building vector (FAISS) index...")
     index_comb, pca_matrix = build_index_for_embeddings(combined_embs, d_comb, n, faiss_args)
-
     index_clip = None
     if has_clip and clip_embs is not None:
         _, d_clip = clip_embs.shape
         index_clip, _ = build_index_for_embeddings(clip_embs, d_clip, n, faiss_args)
+    logger.info("Vector index building complete.")
 
-    # 4. Save results to case-specific directory
+    # 4. Build Text Index (Whoosh)
+    logger.info("Building text (Whoosh) index...")
+    case_output_dir = Path(cfg_data['output_dir']) / cfg_case['case_name']
+    whoosh_dir = case_output_dir / "whoosh_index"
+    whoosh_dir.mkdir(parents=True, exist_ok=True)
+
+    whoosh_ix = create_in(whoosh_dir, schema)
+    writer = whoosh_ix.writer()
+
+    # We need to get the captions from the cache for each file
+    for item in manifest_data:
+        path = item['path']
+        # This is inefficient, but the cache is the only place captions are stored right now
+        # A better architecture would pass captions through the pipeline as well.
+        cached_item = load_cache(fingerprint(Path(path))) or {}
+        caption = cached_item.get("metadata", {}).get("caption", "")
+
+        # Combine all text fields into one 'content' field for searching
+        content = " ".join([
+            Path(path).name,
+            caption
+        ])
+        writer.add_document(path=path, content=content)
+    writer.commit()
+    logger.info("Text index building complete.")
+
+    # 5. Save results
     logger.info("Saving final FAISS indexes, PCA matrix, and manifest...")
-    base_output_dir = Path(cfg_data['output_dir'])
-    case_output_dir = base_output_dir / cfg_case['case_name']
     case_output_dir.mkdir(parents=True, exist_ok=True)
 
     faiss.write_index(index_comb, str(case_output_dir / "combined.index"))

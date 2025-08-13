@@ -34,6 +34,8 @@ import faiss
 import redis
 import json
 import pickle
+from whoosh.index import open_dir as open_whoosh_dir
+from whoosh.qparser import QueryParser
 try:
     faiss.omp_set_num_threads(1)
 except Exception:
@@ -679,6 +681,13 @@ else:
                         st.session_state.pca_obj = pickle.load(f)
                     st.success("Loaded PCA matrix.")
 
+            # Load Whoosh index
+            whoosh_path = index_dir / "whoosh_index"
+            if whoosh_path.exists():
+                whoosh_ix = open_whoosh_dir(str(whoosh_path))
+                st.session_state.whoosh_searcher = whoosh_ix.searcher()
+                st.success("Loaded text index searcher.")
+
         except Exception as e:
             st.error(f"Failed to load index files: {e}")
 
@@ -738,42 +747,53 @@ with col2:
 
 results = st.session_state.get("last_results", [])
 if run_search:
-    # start fresh for each explicit search action
     results = []
-    if nl_query and (st.session_state.faiss_clip is not None or st.session_state.faiss_clip_partial is not None):
+    vector_results = set()
+    keyword_results = set()
+
+    # 1. Vector Search (FAISS)
+    if nl_query and st.session_state.get("faiss_clip"):
         q_emb = compute_clip_text_embedding(nl_query, clip_model)
-        idx_to_use = st.session_state.faiss_clip or st.session_state.faiss_clip_partial
-        D, I = idx_to_use.search(np.array([q_emb], dtype=np.float32), 20)
-        for idx in I[0]:
-            if idx == -1: continue
-            results.append(st.session_state.index_paths[idx])
-    elif nl_query and st.session_state.faiss_clip is None:
-        st.warning("Natural language search requires CLIP index. Please run indexing with CLIP available.")
+        _, I = st.session_state.faiss_clip.search(np.array([q_emb], dtype=np.float32), 100)
+        vector_results.update([st.session_state.index_paths[i] for i in I[0] if i != -1])
     elif uploaded:
         tmp = Image.open(uploaded).convert("RGB")
         vit_t = preprocess_vit(tmp).unsqueeze(0)
         clip_t = (preprocess_clip(tmp).unsqueeze(0) if preprocess_clip is not None else None)
-        if clip_model is not None and clip_t is not None:
-            q_comb, q_clip = compute_batch_embeddings([vit_t.squeeze(0)], [clip_t.squeeze(0)], vit_model, clip_model)
-        else:
-            q_comb, _ = compute_batch_embeddings([vit_t.squeeze(0)], [], vit_model, None)
+        q_comb, _ = compute_batch_embeddings([vit_t.squeeze(0)], [clip_t.squeeze(0)] if clip_t is not None else [], vit_model, clip_model)
         q_emb = q_comb[0].astype(np.float32)
-        idx_to_use = st.session_state.faiss_combined or st.session_state.faiss_partial
-        if idx_to_use is not None:
-            # If PCA was used, project query too
-            if USE_PCA and st.session_state.get("pca_obj") is not None:
-                try:
-                    q_proj = st.session_state.pca_obj.apply_py(np.array([q_emb], dtype=np.float32))
-                    D, I = idx_to_use.search(q_proj.astype(np.float32), 20)
-                except Exception:
-                    D, I = idx_to_use.search(np.array([q_emb], dtype=np.float32), 20)
-            else:
-                D, I = idx_to_use.search(np.array([q_emb], dtype=np.float32), 20)
-            for idx in I[0]:
-                if idx == -1: continue
-                results.append(st.session_state.index_paths[idx])
-    # Persist computed results
-    st.session_state.last_results = results
+
+        if st.session_state.get("faiss_combined"):
+            idx_to_use = st.session_state.faiss_combined
+            if st.session_state.get("pca_obj"):
+                q_emb = st.session_state.pca_obj.apply_py(np.array([q_emb]))[0]
+
+            _, I = idx_to_use.search(np.array([q_emb], dtype=np.float32), 100)
+            vector_results.update([st.session_state.index_paths[i] for i in I[0] if i != -1])
+
+    # 2. Keyword Search (Whoosh)
+    if nl_query and st.session_state.get("whoosh_searcher"):
+        searcher = st.session_state.whoosh_searcher
+        parser = QueryParser("content", schema=searcher.schema)
+        query = parser.parse(nl_query)
+        keyword_hits = searcher.search(query, limit=200)
+        keyword_results.update([hit['path'] for hit in keyword_hits])
+
+    # 3. Combine and Re-rank Results
+    # Simple re-ranking: boost items that appear in both result sets.
+    final_results = []
+    intersection = vector_results.intersection(keyword_results)
+
+    # Add boosted intersection results first
+    final_results.extend(list(intersection))
+
+    # Add remaining vector results
+    final_results.extend([p for p in vector_results if p not in intersection])
+
+    # Add remaining keyword results
+    final_results.extend([p for p in keyword_results if p not in intersection])
+
+    st.session_state.last_results = final_results
 
 # Apply EXIF filters to current results for display
 def _exif_for_path(path_str: str):
