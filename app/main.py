@@ -133,8 +133,7 @@ if "faiss_partial" not in st.session_state:
 if "faiss_clip_partial" not in st.session_state:
     st.session_state.faiss_clip_partial = None  # IndexIDMap2 for CLIP embeddings during indexing
 if "bookmarks" not in st.session_state:
-    # image_path -> {"tags": List[str], "added_ts": float}
-    st.session_state.bookmarks = load_bookmarks()
+    st.session_state.bookmarks = {}
 if "last_results" not in st.session_state:
     # Persist last shown results across UI interactions (e.g., bookmarking)
     st.session_state.last_results = []
@@ -681,6 +680,10 @@ else:
                         st.session_state.pca_obj = pickle.load(f)
                     st.success("Loaded PCA matrix.")
 
+                # Load bookmarks for the case
+                st.session_state.bookmarks = load_bookmarks(index_dir)
+                st.success(f"Loaded {len(st.session_state.bookmarks)} bookmarks.")
+
             # Load Whoosh index
             whoosh_path = index_dir / "whoosh_index"
             if whoosh_path.exists():
@@ -945,39 +948,38 @@ if display_results:
 
             # --- Bookmark/Tags controls ---
             def _is_bm(pth: str) -> bool:
-                return pth in (st.session_state.bookmarks or {})
+                return pth in (st.session_state.get("bookmarks", {}) or {})
+
+            def _save_bms():
+                case_dir = Path(st.session_state.cases_dir) / st.session_state.selected_case
+                save_bookmarks(st.session_state.bookmarks, case_dir)
 
             with tile.expander("Manage Bookmark"):
                 is_bookmarked = _is_bm(r)
 
                 if st.checkbox("Bookmarked", value=is_bookmarked, key=f"bm_check_{r}"):
-                    # If it wasn't bookmarked before, add it now.
                     if not is_bookmarked:
                         st.session_state.bookmarks[r] = st.session_state.bookmarks.get(r, {"tags": [], "notes": "", "added_ts": time.time()})
-                        save_bookmarks(st.session_state.bookmarks)
-                        st.rerun() # Rerun to show the edit fields
+                        _save_bms()
+                        st.rerun()
 
                     bookmark_data = st.session_state.bookmarks.get(r, {})
 
-                    # Tags editor
                     existing_tags = "\n".join(bookmark_data.get("tags", []))
                     new_tags_str = st.text_area("Tags (one per line)", value=existing_tags, key=f"tags_{r}")
 
-                    # Notes editor
                     existing_notes = bookmark_data.get("notes", "")
                     new_notes = st.text_area("Notes", value=existing_notes, key=f"notes_{r}")
 
                     if st.button("Save Bookmark Details", key=f"save_bm_{r}"):
-                        new_tags = [t.strip() for t in new_tags_str.split("\n") if t.strip()]
-                        st.session_state.bookmarks[r]['tags'] = new_tags
+                        st.session_state.bookmarks[r]['tags'] = [t.strip() for t in new_tags_str.split("\n") if t.strip()]
                         st.session_state.bookmarks[r]['notes'] = new_notes
-                        save_bookmarks(st.session_state.bookmarks)
+                        _save_bms()
                         st.success("Bookmark updated!")
 
-                # If it was bookmarked but the box is now unchecked
                 elif is_bookmarked:
                     st.session_state.bookmarks.pop(r, None)
-                    save_bookmarks(st.session_state.bookmarks)
+                    _save_bms()
                     st.rerun()
 
             # --- Info overlay rendering remains, but no explicit button ---
