@@ -34,6 +34,8 @@ import faiss
 import redis
 import json
 import pickle
+from whoosh.index import open_dir as open_whoosh_dir
+from whoosh.qparser import QueryParser
 try:
     faiss.omp_set_num_threads(1)
 except Exception:
@@ -679,6 +681,13 @@ else:
                         st.session_state.pca_obj = pickle.load(f)
                     st.success("Loaded PCA matrix.")
 
+            # Load Whoosh index
+            whoosh_path = index_dir / "whoosh_index"
+            if whoosh_path.exists():
+                whoosh_ix = open_whoosh_dir(str(whoosh_path))
+                st.session_state.whoosh_searcher = whoosh_ix.searcher()
+                st.success("Loaded text index searcher.")
+
         except Exception as e:
             st.error(f"Failed to load index files: {e}")
 
@@ -738,42 +747,53 @@ with col2:
 
 results = st.session_state.get("last_results", [])
 if run_search:
-    # start fresh for each explicit search action
     results = []
-    if nl_query and (st.session_state.faiss_clip is not None or st.session_state.faiss_clip_partial is not None):
+    vector_results = set()
+    keyword_results = set()
+
+    # 1. Vector Search (FAISS)
+    if nl_query and st.session_state.get("faiss_clip"):
         q_emb = compute_clip_text_embedding(nl_query, clip_model)
-        idx_to_use = st.session_state.faiss_clip or st.session_state.faiss_clip_partial
-        D, I = idx_to_use.search(np.array([q_emb], dtype=np.float32), 20)
-        for idx in I[0]:
-            if idx == -1: continue
-            results.append(st.session_state.index_paths[idx])
-    elif nl_query and st.session_state.faiss_clip is None:
-        st.warning("Natural language search requires CLIP index. Please run indexing with CLIP available.")
+        _, I = st.session_state.faiss_clip.search(np.array([q_emb], dtype=np.float32), 100)
+        vector_results.update([st.session_state.index_paths[i] for i in I[0] if i != -1])
     elif uploaded:
         tmp = Image.open(uploaded).convert("RGB")
         vit_t = preprocess_vit(tmp).unsqueeze(0)
         clip_t = (preprocess_clip(tmp).unsqueeze(0) if preprocess_clip is not None else None)
-        if clip_model is not None and clip_t is not None:
-            q_comb, q_clip = compute_batch_embeddings([vit_t.squeeze(0)], [clip_t.squeeze(0)], vit_model, clip_model)
-        else:
-            q_comb, _ = compute_batch_embeddings([vit_t.squeeze(0)], [], vit_model, None)
+        q_comb, _ = compute_batch_embeddings([vit_t.squeeze(0)], [clip_t.squeeze(0)] if clip_t is not None else [], vit_model, clip_model)
         q_emb = q_comb[0].astype(np.float32)
-        idx_to_use = st.session_state.faiss_combined or st.session_state.faiss_partial
-        if idx_to_use is not None:
-            # If PCA was used, project query too
-            if USE_PCA and st.session_state.get("pca_obj") is not None:
-                try:
-                    q_proj = st.session_state.pca_obj.apply_py(np.array([q_emb], dtype=np.float32))
-                    D, I = idx_to_use.search(q_proj.astype(np.float32), 20)
-                except Exception:
-                    D, I = idx_to_use.search(np.array([q_emb], dtype=np.float32), 20)
-            else:
-                D, I = idx_to_use.search(np.array([q_emb], dtype=np.float32), 20)
-            for idx in I[0]:
-                if idx == -1: continue
-                results.append(st.session_state.index_paths[idx])
-    # Persist computed results
-    st.session_state.last_results = results
+
+        if st.session_state.get("faiss_combined"):
+            idx_to_use = st.session_state.faiss_combined
+            if st.session_state.get("pca_obj"):
+                q_emb = st.session_state.pca_obj.apply_py(np.array([q_emb]))[0]
+
+            _, I = idx_to_use.search(np.array([q_emb], dtype=np.float32), 100)
+            vector_results.update([st.session_state.index_paths[i] for i in I[0] if i != -1])
+
+    # 2. Keyword Search (Whoosh)
+    if nl_query and st.session_state.get("whoosh_searcher"):
+        searcher = st.session_state.whoosh_searcher
+        parser = QueryParser("content", schema=searcher.schema)
+        query = parser.parse(nl_query)
+        keyword_hits = searcher.search(query, limit=200)
+        keyword_results.update([hit['path'] for hit in keyword_hits])
+
+    # 3. Combine and Re-rank Results
+    # Simple re-ranking: boost items that appear in both result sets.
+    final_results = []
+    intersection = vector_results.intersection(keyword_results)
+
+    # Add boosted intersection results first
+    final_results.extend(list(intersection))
+
+    # Add remaining vector results
+    final_results.extend([p for p in vector_results if p not in intersection])
+
+    # Add remaining keyword results
+    final_results.extend([p for p in keyword_results if p not in intersection])
+
+    st.session_state.last_results = final_results
 
 # Apply EXIF filters to current results for display
 def _exif_for_path(path_str: str):
@@ -900,63 +920,65 @@ if display_results:
 
             # Display hashes if manifest is loaded
             if 'manifest' in st.session_state and r in st.session_state.manifest:
-                hashes = st.session_state.manifest[r].get('hashes', {})
-                if hashes:
-                    for hash_name, hash_value in hashes.items():
-                        if hash_value:
-                            tile.code(f"{hash_name.upper()}: {hash_value[:16]}...")
+                with tile.expander("Show Details"):
+                    # Get all data for the item
+                    manifest_item = st.session_state.manifest[r]
+                    cached_meta = load_cache(fingerprint(Path(r))) or {}
 
-            meta = load_cache(fingerprint(Path(r)))
-            if meta and meta.get("metadata", {}).get("caption"):
-                tile.write(meta["metadata"]["caption"][:140])
+                    st.code(manifest_item['path'], language='text')
+
+                    st.markdown("**Hashes**")
+                    hashes = manifest_item.get('hashes', {})
+                    if hashes:
+                        for hash_name, hash_value in hashes.items():
+                            st.text(f"{hash_name.upper()}: {hash_value}")
+
+                    st.markdown("**EXIF Data**")
+                    exif_data = cached_meta.get("metadata", {}).get("exif", {})
+                    if exif_data:
+                        for key, value in exif_data.items():
+                            st.text(f"{key}: {value}")
+
+                    st.markdown("**AI Caption**")
+                    caption = cached_meta.get("metadata", {}).get("caption")
+                    st.text(caption or "Not available.")
 
             # --- Bookmark/Tags controls ---
             def _is_bm(pth: str) -> bool:
                 return pth in (st.session_state.bookmarks or {})
-            def _add_bm(pth: str):
-                if pth not in st.session_state.bookmarks:
-                    st.session_state.bookmarks[pth] = {"tags": [], "added_ts": time.time()}
-                    save_bookmarks(st.session_state.bookmarks)
-            def _remove_bm(pth: str):
-                if pth in st.session_state.bookmarks:
-                    st.session_state.bookmarks.pop(pth, None)
-                    save_bookmarks(st.session_state.bookmarks)
-            def _update_tags(pth: str, tags_str: str):
-                tags = [t.strip() for t in (tags_str or "").replace(";", ",").split(",") if t.strip()]
-                if pth not in st.session_state.bookmarks:
-                    st.session_state.bookmarks[pth] = {"tags": tags, "added_ts": time.time()}
-                else:
-                    st.session_state.bookmarks[pth]["tags"] = tags
-                save_bookmarks(st.session_state.bookmarks)
 
-            tg_key = f"bm_tags_{r}"
-            is_bm_now = _is_bm(r)
-            # Overlay bookmark icon (visual)
-            toggle_param = "add_bm" if not is_bm_now else "remove_bm"
-            class_suffix = " active" if is_bm_now else ""
-            star_text = "★" if is_bm_now else "☆"
-            tile.markdown(
-                f"<div class='bm-overlay'><span class='bm-icon{class_suffix}'>{star_text}</span></div>",
-                unsafe_allow_html=True,
-            )
-            # Reliable Streamlit toggle button
-            bm_btn_key = f"bm_btn_{r}"
-            if tile.button(("Unbookmark ★" if is_bm_now else "Bookmark ☆"), key=bm_btn_key):
-                if is_bm_now:
-                    _remove_bm(r)
-                    is_bm_now = False
-                else:
-                    _add_bm(r)
-                    is_bm_now = True
-            if is_bm_now:
-                existing_tags = ", ".join(st.session_state.bookmarks.get(r, {}).get("tags", []))
-                new_tags = tile.text_input("Add/edit tags", value=existing_tags, key=tg_key, help="Comma or semicolon separated tags")
-                if new_tags != existing_tags:
-                    _update_tags(r, new_tags)
-                chips = st.session_state.bookmarks.get(r, {}).get("tags", [])
-                if chips:
-                    chip_html = " ".join([f"<span class='tag-chip'>{c}</span>" for c in chips])
-                    tile.markdown(chip_html, unsafe_allow_html=True)
+            with tile.expander("Manage Bookmark"):
+                is_bookmarked = _is_bm(r)
+
+                if st.checkbox("Bookmarked", value=is_bookmarked, key=f"bm_check_{r}"):
+                    # If it wasn't bookmarked before, add it now.
+                    if not is_bookmarked:
+                        st.session_state.bookmarks[r] = st.session_state.bookmarks.get(r, {"tags": [], "notes": "", "added_ts": time.time()})
+                        save_bookmarks(st.session_state.bookmarks)
+                        st.rerun() # Rerun to show the edit fields
+
+                    bookmark_data = st.session_state.bookmarks.get(r, {})
+
+                    # Tags editor
+                    existing_tags = "\n".join(bookmark_data.get("tags", []))
+                    new_tags_str = st.text_area("Tags (one per line)", value=existing_tags, key=f"tags_{r}")
+
+                    # Notes editor
+                    existing_notes = bookmark_data.get("notes", "")
+                    new_notes = st.text_area("Notes", value=existing_notes, key=f"notes_{r}")
+
+                    if st.button("Save Bookmark Details", key=f"save_bm_{r}"):
+                        new_tags = [t.strip() for t in new_tags_str.split("\n") if t.strip()]
+                        st.session_state.bookmarks[r]['tags'] = new_tags
+                        st.session_state.bookmarks[r]['notes'] = new_notes
+                        save_bookmarks(st.session_state.bookmarks)
+                        st.success("Bookmark updated!")
+
+                # If it was bookmarked but the box is now unchecked
+                elif is_bookmarked:
+                    st.session_state.bookmarks.pop(r, None)
+                    save_bookmarks(st.session_state.bookmarks)
+                    st.rerun()
 
             # --- Info overlay rendering remains, but no explicit button ---
             info_state_key = f"info_state_{r}"
