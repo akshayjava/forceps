@@ -24,7 +24,6 @@ except Exception:
 
 CACHE_DIR = Path("./cache")
 CACHE_DIR.mkdir(exist_ok=True)
-BOOKMARKS_FILE = CACHE_DIR / "bookmarks.json"
 
 class Hasher(abc.ABC):
     """Abstract base class for all hashers."""
@@ -96,33 +95,40 @@ def read_exif(path: Path):
         return {}
 
 # ---------------- Bookmarks helpers ----------------
-def load_bookmarks() -> Dict[str, Dict[str, Any]]:
+def load_bookmarks(case_dir: Path) -> Dict[str, Dict[str, Any]]:
     """Load bookmarks mapping from image path -> {tags: List[str], added_ts: float}.
     Returns empty dict if not found or invalid.
     """
-    if BOOKMARKS_FILE.exists():
+    bookmarks_file = case_dir / "bookmarks.json"
+    if bookmarks_file.exists():
         try:
-            data = json.load(open(BOOKMARKS_FILE, "r"))
+            data = json.load(open(bookmarks_file, "r"))
             # normalize
             norm: Dict[str, Dict[str, Any]] = {}
             for k, v in (data or {}).items():
                 tags = v.get("tags") if isinstance(v, dict) else []
                 if not isinstance(tags, list):
                     tags = []
+                notes = v.get("notes", "") if isinstance(v, dict) else ""
                 added = v.get("added_ts") if isinstance(v, dict) else None
                 if not isinstance(added, (int, float)):
                     added = time.time()
-                norm[k] = {"tags": [str(t).strip() for t in tags if str(t).strip()], "added_ts": float(added)}
+                norm[k] = {
+                    "tags": [str(t).strip() for t in tags if str(t).strip()],
+                    "notes": str(notes),
+                    "added_ts": float(added)
+                }
             return norm
         except Exception:
             return {}
     return {}
 
-def save_bookmarks(bookmarks: Dict[str, Dict[str, Any]]):
+def save_bookmarks(bookmarks: Dict[str, Dict[str, Any]], case_dir: Path):
     try:
-        BOOKMARKS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(BOOKMARKS_FILE, "w") as f:
-            json.dump(bookmarks, f)
+        bookmarks_file = case_dir / "bookmarks.json"
+        bookmarks_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(bookmarks_file, "w") as f:
+            json.dump(bookmarks, f, indent=2)
     except Exception:
         pass
 
