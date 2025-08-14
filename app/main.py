@@ -36,6 +36,7 @@ import json
 import pickle
 from whoosh.index import open_dir as open_whoosh_dir
 from whoosh.qparser import QueryParser
+from sklearn.cluster import MiniBatchKMeans
 try:
     faiss.omp_set_num_threads(1)
 except Exception:
@@ -691,6 +692,15 @@ else:
                 st.session_state.whoosh_searcher = whoosh_ix.searcher()
                 st.success("Loaded text index searcher.")
 
+            # Load embeddings for clustering
+            embeddings_path = index_dir / "embeddings_combined.mmap"
+            if embeddings_path.exists() and 'manifest' in st.session_state:
+                num_embeddings = len(st.session_state.index_paths)
+                # This is a bit of a hack, we need to get the dimension from the faiss index
+                embedding_dim = st.session_state.faiss_combined.d
+                st.session_state.embeddings = np.memmap(embeddings_path, dtype='float32', mode='r', shape=(num_embeddings, embedding_dim))
+                st.success(f"Memory-mapped {num_embeddings} embeddings for clustering.")
+
         except Exception as e:
             st.error(f"Failed to load index files: {e}")
 
@@ -854,6 +864,30 @@ if not results:
 elif not display_results:
     st.warning("No results match current filters.")
 
+if st.session_state.get("last_results") and st.session_state.get("embeddings") is not None:
+    st.markdown("---")
+    st.subheader("Cluster Analysis")
+
+    num_clusters = st.slider("Number of Clusters", min_value=2, max_value=50, value=10)
+
+    if st.button("Cluster Displayed Results"):
+        with st.spinner("Clustering results..."):
+            paths_to_cluster = st.session_state.last_results
+            path_to_idx = {path: i for i, path in enumerate(st.session_state.index_paths)}
+            result_indices = [path_to_idx[p] for p in paths_to_cluster if p in path_to_idx]
+
+            if result_indices:
+                result_embeddings = st.session_state.embeddings[result_indices]
+
+                kmeans = MiniBatchKMeans(n_clusters=num_clusters, random_state=0, batch_size=256, n_init='auto')
+                kmeans.fit(result_embeddings)
+
+                st.session_state.cluster_labels = {path: label for path, label in zip(paths_to_cluster, kmeans.labels_)}
+                st.success(f"Successfully clustered results into {num_clusters} groups.")
+                st.rerun()
+            else:
+                st.warning("No results to cluster.")
+
 # ----- Tags page: overview of tags and images -----
 st.markdown("---")
 st.subheader("Tags Overview")
@@ -898,130 +932,114 @@ else:
         except Exception:
             cols[i % 5].write(Path(r).name)
 
-if display_results:
-    st.markdown("### Top results")
-    cols = st.columns(5)
-    for i, r in enumerate(display_results[:25]):
+def display_image_tile(tile_container, image_path):
+    """Renders a single image tile with all its controls."""
+    r = image_path
+    try:
+        # --- Image Display ---
+        encoded = urllib.parse.quote(r)
         try:
-            tile = cols[i%5]
-            # Image container with overlay layers (use data URL to avoid broken local paths)
-            encoded = urllib.parse.quote(r)
-            try:
-                mime, _ = mimetypes.guess_type(r)
-                mime = mime or "image/jpeg"
-                with open(r, "rb") as _f:
-                    b64 = base64.b64encode(_f.read()).decode("utf-8")
-                data_url = f"data:{mime};base64,{b64}"
-            except Exception:
-                data_url = ""
-            tile.markdown(f"""
-            <div class='img-card'>
-              <img src='{data_url}' />
-            </div>
-            """, unsafe_allow_html=True)
-            tile.caption(Path(r).name)
+            mime, _ = mimetypes.guess_type(r)
+            mime = mime or "image/jpeg"
+            with open(r, "rb") as _f:
+                b64 = base64.b64encode(_f.read()).decode("utf-8")
+            data_url = f"data:{mime};base64,{b64}"
+        except Exception:
+            data_url = ""
+        tile_container.markdown(f"<div class='img-card'><img src='{data_url}' /></div>", unsafe_allow_html=True)
+        tile_container.caption(Path(r).name)
 
-            # Display hashes if manifest is loaded
-            if 'manifest' in st.session_state and r in st.session_state.manifest:
-                with tile.expander("Show Details"):
-                    # Get all data for the item
-                    manifest_item = st.session_state.manifest[r]
-                    cached_meta = load_cache(fingerprint(Path(r))) or {}
+        # --- Details Expander ---
+        if 'manifest' in st.session_state and r in st.session_state.manifest:
+            with tile_container.expander("Show Details"):
+                manifest_item = st.session_state.manifest[r]
+                cached_meta = load_cache(fingerprint(Path(r))) or {}
 
-                    st.code(manifest_item['path'], language='text')
+                st.code(manifest_item['path'], language='text')
 
-                    st.markdown("**Hashes**")
-                    hashes = manifest_item.get('hashes', {})
-                    if hashes:
-                        for hash_name, hash_value in hashes.items():
-                            st.text(f"{hash_name.upper()}: {hash_value}")
+                st.markdown("**Hashes**")
+                hashes = manifest_item.get('hashes', {})
+                if hashes:
+                    for hash_name, hash_value in hashes.items():
+                        st.text(f"{hash_name.upper()}: {hash_value}")
 
-                    st.markdown("**EXIF Data**")
-                    exif_data = cached_meta.get("metadata", {}).get("exif", {})
-                    if exif_data:
-                        for key, value in exif_data.items():
-                            st.text(f"{key}: {value}")
+                st.markdown("**EXIF Data**")
+                exif_data = cached_meta.get("metadata", {}).get("exif", {})
+                if exif_data:
+                    for key, value in exif_data.items():
+                        st.text(f"{key}: {value}")
 
-                    st.markdown("**AI Caption**")
-                    caption = cached_meta.get("metadata", {}).get("caption")
-                    st.text(caption or "Not available.")
+                st.markdown("**AI Caption**")
+                caption = cached_meta.get("metadata", {}).get("caption")
+                st.text(caption or "Not available.")
 
-            # --- Bookmark/Tags controls ---
-            def _is_bm(pth: str) -> bool:
-                return pth in (st.session_state.get("bookmarks", {}) or {})
+        # --- Bookmark/Tags Expander ---
+        def _is_bm(pth: str) -> bool:
+            return pth in (st.session_state.get("bookmarks", {}) or {})
 
-            def _save_bms():
-                case_dir = Path(st.session_state.cases_dir) / st.session_state.selected_case
-                save_bookmarks(st.session_state.bookmarks, case_dir)
+        def _save_bms():
+            case_dir = Path(st.session_state.cases_dir) / st.session_state.selected_case
+            save_bookmarks(st.session_state.bookmarks, case_dir)
 
-            with tile.expander("Manage Bookmark"):
-                is_bookmarked = _is_bm(r)
+        with tile_container.expander("Manage Bookmark"):
+            is_bookmarked = _is_bm(r)
 
-                if st.checkbox("Bookmarked", value=is_bookmarked, key=f"bm_check_{r}"):
-                    if not is_bookmarked:
-                        st.session_state.bookmarks[r] = st.session_state.bookmarks.get(r, {"tags": [], "notes": "", "added_ts": time.time()})
-                        _save_bms()
-                        st.rerun()
-
-                    bookmark_data = st.session_state.bookmarks.get(r, {})
-
-                    existing_tags = "\n".join(bookmark_data.get("tags", []))
-                    new_tags_str = st.text_area("Tags (one per line)", value=existing_tags, key=f"tags_{r}")
-
-                    existing_notes = bookmark_data.get("notes", "")
-                    new_notes = st.text_area("Notes", value=existing_notes, key=f"notes_{r}")
-
-                    if st.button("Save Bookmark Details", key=f"save_bm_{r}"):
-                        st.session_state.bookmarks[r]['tags'] = [t.strip() for t in new_tags_str.split("\n") if t.strip()]
-                        st.session_state.bookmarks[r]['notes'] = new_notes
-                        _save_bms()
-                        st.success("Bookmark updated!")
-
-                elif is_bookmarked:
-                    st.session_state.bookmarks.pop(r, None)
+            if st.checkbox("Bookmarked", value=is_bookmarked, key=f"bm_check_{r}"):
+                if not is_bookmarked:
+                    st.session_state.bookmarks[r] = st.session_state.bookmarks.get(r, {"tags": [], "notes": "", "added_ts": time.time()})
                     _save_bms()
                     st.rerun()
 
-            # --- Info overlay rendering remains, but no explicit button ---
-            info_state_key = f"info_state_{r}"
-            if st.session_state.get(info_state_key, False):
-                details = _gather_metadata_for_path(Path(r))
-                # Shield against HTML injection in strings
-                def esc(x):
-                    try:
-                        return html.escape(str(x))
-                    except Exception:
-                        return str(x)
-                path_s = esc(details.get('path',''))
-                make_s = esc(details.get('make',''))
-                model_s = esc(details.get('model',''))
-                dt_s = esc(details.get('datetime',''))
-                ph = esc(details.get('phash',''))
-                ah = esc(details.get('ahash',''))
-                dh = esc(details.get('dhash',''))
-                cap = details.get('caption','')
+                bookmark_data = st.session_state.bookmarks.get(r, {})
 
-                # Structured table rendering
-                html_parts = [
-                    "<div class='info-panel'>",
-                    "  <div class='panel-bg'></div>",
-                    "  <div class='info-box'>",
-                    f"    <a class='info-close' href='?close_info={encoded}'>×</a>",
-                    "    <h4>EXIF & Metadata</h4>",
-                    "    <table class='meta-table'>",
-                    f"      <tr><th>Path</th><td>{path_s}</td></tr>",
-                    f"      <tr><th>Make / Model</th><td>{make_s} <span class='code-badge'>/</span> {model_s}</td></tr>",
-                    f"      <tr><th>Date / Time</th><td>{dt_s}</td></tr>",
-                    f"      <tr><th>Hashes</th><td><span class='code-badge'>p:{ph}</span><span class='code-badge'>a:{ah}</span><span class='code-badge'>d:{dh}</span></td></tr>",
-                    "    </table>",
-                ]
-                if cap:
-                    html_parts.append("    <div class='caption-block'>" + esc(cap) + "</div>")
-                html_parts.append("  </div>")
-                html_parts.append("</div>")
-                tile.markdown("\n".join(html_parts), unsafe_allow_html=True)
-        except Exception:
-            cols[i%5].write(Path(r).name)
+                existing_tags = "\n".join(bookmark_data.get("tags", []))
+                new_tags_str = st.text_area("Tags (one per line)", value=existing_tags, key=f"tags_{r}")
+
+                existing_notes = bookmark_data.get("notes", "")
+                new_notes = st.text_area("Notes", value=existing_notes, key=f"notes_{r}")
+
+                if st.button("Save Bookmark Details", key=f"save_bm_{r}"):
+                    st.session_state.bookmarks[r]['tags'] = [t.strip() for t in new_tags_str.split("\n") if t.strip()]
+                    st.session_state.bookmarks[r]['notes'] = new_notes
+                    _save_bms()
+                    st.success("Bookmark updated!")
+
+            elif is_bookmarked:
+                st.session_state.bookmarks.pop(r, None)
+                _save_bms()
+                st.rerun()
+    except Exception as e:
+        tile_container.error(f"Error: {e}")
+        tile_container.write(Path(r).name)
+
+
+if display_results:
+    st.markdown("### Top results")
+
+    # If results have been clustered, group them
+    if 'cluster_labels' in st.session_state:
+        clusters = {}
+        for path in display_results:
+            label = st.session_state.cluster_labels.get(path)
+            if label is not None:
+                if label not in clusters:
+                    clusters[label] = []
+                clusters[label].append(path)
+
+        if st.button("Clear Clustering"):
+            del st.session_state['cluster_labels']
+            st.rerun()
+
+        for label, paths in sorted(clusters.items()):
+            st.markdown(f"--- \n#### Cluster {label+1} ({len(paths)} images)")
+            cols = st.columns(5)
+            for i, r in enumerate(paths):
+                display_image_tile(cols[i%5], r)
+    else:
+        # Original, unclustered display
+        cols = st.columns(5)
+        for i, r in enumerate(display_results[:25]):
+            display_image_tile(cols[i%5], r)
 
 st.sidebar.markdown("---")
 if st.sidebar.button("Exit App"):
