@@ -86,14 +86,17 @@ def test_compute_embeddings_for_job(tmp_path):
         max_workers=0 # Use 0 workers to avoid multiprocessing issues in tests
     )
 
-    # 2. Create dummy image files
+    # 2. Create dummy image job data
     img_paths = [
         str(create_dummy_image(tmp_path / "img1.png")),
         str(create_dummy_image(tmp_path / "img2.png"))
     ]
+    image_job_data = [
+        {"path": p, "hashes": {"sha256": "dummy_hash_1"}} for p in img_paths
+    ]
 
     # 3. Call the function
-    results = compute_embeddings_for_job(img_paths, models, args)
+    results = compute_embeddings_for_job(image_job_data, models, args)
 
     # 4. Assertions
     assert len(results) == 2

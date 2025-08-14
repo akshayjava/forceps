@@ -24,7 +24,6 @@ from app.utils import (
     fingerprint,
     load_cache,
     save_cache,
-    compute_perceptual_hashes,
     read_exif,
 )
 from app.llm_ollama import ollama_installed, generate_caption_ollama, model_available

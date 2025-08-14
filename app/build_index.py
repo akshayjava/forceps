@@ -82,6 +82,7 @@ def build_index_for_embeddings(embeddings, d, n, args):
 def main():
     parser = argparse.ArgumentParser(description="FORCEPS Index Builder")
     parser.add_argument("--config", type=str, default="app/config.yaml", help="Path to the configuration file.")
+    parser.add_argument("--mode", type=str, default="full", choices=["full", "triage"], help="Indexing mode.")
     args = parser.parse_args()
 
     try:
@@ -102,7 +103,7 @@ def main():
     # Create a simple namespace object for the build_index_for_embeddings function
     faiss_args = argparse.Namespace(**cfg_faiss)
 
-    logger.info("--- FORCEPS Index Builder Starting ---")
+    logger.info(f"--- FORCEPS Index Builder Starting (Mode: {args.mode}) ---")
     logger.info(f"Case Name: {cfg_case.get('case_name')}")
 
     try:
@@ -139,63 +140,60 @@ def main():
         logger.warning("No embeddings were found in the results queue. Exiting.")
         return
 
-    # 2. Prepare data for FAISS
-    logger.info("Preparing data for indexing...")
+    # 2. Prepare manifest data
+    logger.info("Preparing manifest data...")
     manifest_data = [{"path": res["path"], "hashes": res.get("hashes")} for res in all_results]
-    combined_embs = np.array([res["combined_emb"] for res in all_results], dtype=np.float32)
 
-    has_clip = "clip_emb" in all_results[0]
-    clip_embs = None
-    if has_clip:
-        clip_embs = np.array([res["clip_emb"] for res in all_results if "clip_emb" in res], dtype=np.float32)
-
-    n, d_comb = combined_embs.shape
-
-    # 3. Build Vector Index (FAISS)
-    logger.info("Building vector (FAISS) index...")
-    index_comb, pca_matrix = build_index_for_embeddings(combined_embs, d_comb, n, faiss_args)
-    index_clip = None
-    if has_clip and clip_embs is not None:
-        _, d_clip = clip_embs.shape
-        index_clip, _ = build_index_for_embeddings(clip_embs, d_clip, n, faiss_args)
-    logger.info("Vector index building complete.")
-
-    # 4. Build Text Index (Whoosh)
-    logger.info("Building text (Whoosh) index...")
     case_output_dir = Path(cfg_data['output_dir']) / cfg_case['case_name']
-    whoosh_dir = case_output_dir / "whoosh_index"
-    whoosh_dir.mkdir(parents=True, exist_ok=True)
-
-    whoosh_ix = create_in(whoosh_dir, schema)
-    writer = whoosh_ix.writer()
-
-    # We need to get the captions from the cache for each file
-    for item in manifest_data:
-        path = item['path']
-        # This is inefficient, but the cache is the only place captions are stored right now
-        # A better architecture would pass captions through the pipeline as well.
-        cached_item = load_cache(fingerprint(Path(path))) or {}
-        caption = cached_item.get("metadata", {}).get("caption", "")
-
-        # Combine all text fields into one 'content' field for searching
-        content = " ".join([
-            Path(path).name,
-            caption
-        ])
-        writer.add_document(path=path, content=content)
-    writer.commit()
-    logger.info("Text index building complete.")
-
-    # 5. Save results
-    logger.info("Saving final FAISS indexes, PCA matrix, and manifest...")
     case_output_dir.mkdir(parents=True, exist_ok=True)
 
-    faiss.write_index(index_comb, str(case_output_dir / "combined.index"))
-    if index_clip:
-        faiss.write_index(index_clip, str(case_output_dir / "clip.index"))
-    if pca_matrix:
-        with open(case_output_dir / "pca.matrix.pkl", "wb") as f:
-            pickle.dump(pca_matrix, f)
+    if args.mode == "full":
+        # Full mode: build all indexes
+        logger.info("Running in full mode. Building all indexes.")
+
+        # Prepare embedding data
+        combined_embs = np.array([res["combined_emb"] for res in all_results], dtype=np.float32)
+        has_clip = "clip_emb" in all_results[0]
+        clip_embs = None
+        if has_clip:
+            clip_embs = np.array([res["clip_emb"] for res in all_results if "clip_emb" in res], dtype=np.float32)
+        n, d_comb = combined_embs.shape
+
+        # Build Vector Index (FAISS)
+        logger.info("Building vector (FAISS) index...")
+        index_comb, pca_matrix = build_index_for_embeddings(combined_embs, d_comb, n, faiss_args)
+        index_clip = None
+        if has_clip and clip_embs is not None:
+            _, d_clip = clip_embs.shape
+            index_clip, _ = build_index_for_embeddings(clip_embs, d_clip, n, faiss_args)
+        logger.info("Vector index building complete.")
+
+        # Build Text Index (Whoosh)
+        logger.info("Building text (Whoosh) index...")
+        whoosh_dir = case_output_dir / "whoosh_index"
+        whoosh_dir.mkdir(parents=True, exist_ok=True)
+        whoosh_ix = create_in(whoosh_dir, schema)
+        writer = whoosh_ix.writer()
+        for item in manifest_data:
+            path = item['path']
+            cached_item = load_cache(fingerprint(Path(path))) or {}
+            caption = cached_item.get("metadata", {}).get("caption", "")
+            content = " ".join([Path(path).name, caption])
+            writer.add_document(path=path, content=content)
+        writer.commit()
+        logger.info("Text index building complete.")
+
+        # Save FAISS and PCA files
+        logger.info("Saving FAISS indexes and PCA matrix...")
+        faiss.write_index(index_comb, str(case_output_dir / "combined.index"))
+        if index_clip:
+            faiss.write_index(index_clip, str(case_output_dir / "clip.index"))
+        if pca_matrix:
+            with open(case_output_dir / "pca.matrix.pkl", "wb") as f:
+                pickle.dump(pca_matrix, f)
+
+    # Always save the manifest file
+    logger.info("Saving manifest file...")
     with open(case_output_dir / "manifest.json", "w") as f:
         json.dump(manifest_data, f, indent=2)
 

@@ -1,0 +1,16 @@
+redis
+faiss-cpu
+numpy
+torch
+Pillow
+opencv-python
+pyturbojpeg
+streamlit
+pandas
+onnx
+onnxruntime
+pytest
+imagehash
+whoosh
+matplotlib
+scikit-learn
