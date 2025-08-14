@@ -55,6 +55,7 @@ def discover_and_process_files(root_dir: str, hashers: list, max_workers: int) -
 def main():
     parser = argparse.ArgumentParser(description="FORCEPS Job Enqueuer")
     parser.add_argument("--config", type=str, default="app/config.yaml", help="Path to the configuration file.")
+    parser.add_argument("--mode", type=str, default="full", choices=["full", "triage"], help="Indexing mode.")
     args = parser.parse_args()
 
     try:
@@ -70,12 +71,17 @@ def main():
     cfg_redis = config['redis']
     cfg_data = config['data']
     cfg_perf = config['performance']['enqueuer']
-    cfg_hashing = config.get('hashing', [])
 
-    logger.info("--- FORCEPS Job Enqueuer ---")
+    logger.info(f"--- FORCEPS Job Enqueuer (Mode: {args.mode}) ---")
 
-    # 1. Initialize hashers from config
-    hashers = get_hashers(cfg_hashing)
+    # 1. Initialize hashers based on mode
+    if args.mode == "triage":
+        logger.info("Triage mode enabled: only perceptual hashes will be computed.")
+        hashers_to_run = ["perceptual"]
+    else:
+        hashers_to_run = config.get('hashing', [])
+
+    hashers = get_hashers(hashers_to_run)
     if not hashers:
         logger.warning("No hashers configured. No hashes will be computed.")
 

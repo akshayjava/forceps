@@ -1,7 +1,8 @@
 import pytest
 from pathlib import Path
 from app.hashers import get_hashers
-from app.hashers.standard import SHA256Hasher, PerceptualHasher
+from app.hashers.standard import SHA256Hasher
+from app.hashers.perceptual import PerceptualHasher
 from tests.test_utils import create_dummy_image
 
 def test_sha256_hasher(tmp_path):

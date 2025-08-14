@@ -1,9 +1,8 @@
 from typing import List, Dict, Type
-from app.utils import Hasher
-from .standard import SHA256Hasher, PerceptualHasher
-
-# Import other hashers here as they are added
-# e.g. from .photodna import PhotoDNAHasher
+from .base import Hasher
+from .standard import SHA256Hasher
+from .perceptual import PerceptualHasher, compute_perceptual_hashes
+# from .photodna import PhotoDNAHasher # Example for when it's added
 
 # The registry maps a name from the config file to the Hasher class
 HASHER_REGISTRY: Dict[str, Type[Hasher]] = {

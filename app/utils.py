@@ -25,22 +25,6 @@ except Exception:
 CACHE_DIR = Path("./cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
-class Hasher(abc.ABC):
-    """Abstract base class for all hashers."""
-    @abc.abstractmethod
-    def compute(self, filepath: Path) -> Dict[str, Any]:
-        """
-        Compute hashes for a given file.
-
-        Args:
-            filepath: Path to the file.
-
-        Returns:
-            A dictionary where keys are hash names (e.g., "sha256")
-            and values are the computed hash values.
-        """
-        pass
-
 def is_image_file(p: Path):
     try:
         if p.suffix.lower() in {".jpg",".jpeg",".png",".bmp",".gif",".tiff",".webp"}:

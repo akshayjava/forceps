@@ -1,12 +1,13 @@
 import hashlib
 from pathlib import Path
 from typing import Dict, Any
-from PIL import Image
-import imagehash
-from app.utils import Hasher
+from .base import Hasher
 
 class SHA256Hasher(Hasher):
     """Computes the SHA-256 hash of a file."""
+    def __init__(self):
+        super().__init__(name="sha256")
+
     def compute(self, filepath: Path) -> Dict[str, Any]:
         h = hashlib.sha256()
         b = bytearray(128 * 1024)
@@ -18,16 +19,3 @@ class SHA256Hasher(Hasher):
             return {"sha256": h.hexdigest()}
         except Exception:
             return {"sha256": None}
-
-class PerceptualHasher(Hasher):
-    """Computes perceptual hashes (phash, ahash, dhash)."""
-    def compute(self, filepath: Path) -> Dict[str, Any]:
-        try:
-            im = Image.open(filepath).convert("RGB")
-            return {
-                "phash": str(imagehash.phash(im)),
-                "ahash": str(imagehash.average_hash(im)),
-                "dhash": str(imagehash.dhash(im))
-            }
-        except Exception:
-            return {"phash": None, "ahash": None, "dhash": None}
