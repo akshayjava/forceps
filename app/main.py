@@ -34,6 +34,7 @@ import faiss
 import redis
 import json
 import pickle
+import yaml
 from whoosh.index import open_dir as open_whoosh_dir
 from whoosh.qparser import QueryParser
 from sklearn.cluster import MiniBatchKMeans
@@ -171,6 +172,8 @@ if "case_type" not in st.session_state:
     st.session_state.case_type = None # Can be 'full' or 'triage'
 if "search_distances" not in st.session_state:
     st.session_state.search_distances = {}
+if "selected_items" not in st.session_state:
+    st.session_state.selected_items = set()
 
 def _get_query_params_compat():
     try:
@@ -387,6 +390,66 @@ with col_pdf:
         st.download_button("PDF", data=data_pdf, file_name="bookmarks.pdf", mime="application/pdf")
     except Exception as _:
         st.caption(":warning: PDF export failed")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Interactive Indexing")
+selected_count = len(st.session_state.get("selected_items", set()))
+st.sidebar.info(f"{selected_count} items selected for indexing.")
+
+# This feature is only active in triage mode when items are selected.
+if st.session_state.get("case_type") == "triage" and selected_count > 0:
+    st.sidebar.markdown("---") # Visual separator
+
+    default_case_name = f"{st.session_state.get('selected_case', 'case')}-selection-{selected_count}"
+    new_case_name = st.sidebar.text_input("New Case Name for Selection", value=default_case_name)
+
+    if st.sidebar.button("🚀 Create Full Index from Selection"):
+        if new_case_name and not new_case_name.isspace():
+            try:
+                # 1. Load config to get Redis details
+                with open("app/config.yaml", 'r') as f:
+                    config = yaml.safe_load(f)
+                cfg_redis = config['redis']
+
+                # 2. Connect to Redis
+                r = redis.Redis(host=cfg_redis['host'], port=cfg_redis['port'], db=0)
+                r.ping()
+
+                # 3. Prepare the job data
+                paths_to_index = list(st.session_state.selected_items)
+                job_data = []
+                for path in paths_to_index:
+                    if path in st.session_state.manifest:
+                        # We need the hashes from the original manifest
+                        job_data.append({
+                            "path": path,
+                            "hashes": st.session_state.manifest[path].get("hashes", {})
+                        })
+
+                if not job_data:
+                    st.sidebar.error("No valid items to enqueue.")
+                else:
+                    # 4. Enqueue the job (as a single batch)
+                    r.rpush(cfg_redis['job_queue'], json.dumps(job_data))
+
+                    # 5. Provide feedback and next steps
+                    st.sidebar.success(f"Successfully enqueued {len(job_data)} items for indexing.")
+                    st.sidebar.info(f"A new case will be created as '{new_case_name}'.")
+                    st.sidebar.warning("To finalize, run the index builder from your terminal with the new case name:")
+                    st.sidebar.code(f"python3 app/build_index.py --case_name \"{new_case_name}\"")
+
+                    # Clear the selection
+                    st.session_state.selected_items = set()
+                    st.rerun()
+
+            except FileNotFoundError:
+                st.sidebar.error("Could not find app/config.yaml")
+            except redis.exceptions.ConnectionError:
+                st.sidebar.error(f"Could not connect to Redis at {cfg_redis.get('host', 'localhost')}:{cfg_redis.get('port', 6379)}.")
+            except Exception as e:
+                st.sidebar.error(f"An error occurred: {e}")
+        else:
+            st.sidebar.error("Please provide a valid name for the new case.")
 
 # Clear bookmarks/tags actions
 st.sidebar.markdown("")
@@ -938,6 +1001,17 @@ with search_tab:
             if dist is not None and dist > 0:
                 caption_text += f" (dist: {dist})"
             tile_container.caption(caption_text)
+
+            # --- Selection Checkbox ---
+            is_selected = r in st.session_state.get("selected_items", set())
+            # The checkbox state determines if the item should be in the set.
+            if tile_container.checkbox("Select for full index", value=is_selected, key=f"select_{r}"):
+                if not is_selected:
+                    st.session_state.selected_items.add(r)
+                    st.rerun()
+            elif is_selected:
+                st.session_state.selected_items.remove(r)
+                st.rerun()
 
             # --- Details Expander ---
             if 'manifest' in st.session_state and r in st.session_state.manifest:
