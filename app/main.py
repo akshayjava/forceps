@@ -617,12 +617,375 @@ if save_idx_btn:
     else:
         st.error("No index to save yet.")
 
-# Backend Monitoring
-st.sidebar.header("Backend Controls")
-st.session_state.redis_host = st.sidebar.text_input("Redis Host", value="localhost")
-st.session_state.redis_port = st.sidebar.number_input("Redis Port", value=6379)
+# Main app layout
+search_tab, reporting_tab = st.tabs(["Search & Results", "Reporting"])
 
-st.sidebar.header("Load Case for Searching")
+with search_tab:
+    st.header("Backend Monitoring")
+    if st.button("Refresh Queue Stats"):
+        try:
+            r = redis.Redis(host=st.session_state.redis_host, port=st.session_state.redis_port, db=0)
+            jobs_in_queue = r.llen("forceps:job_queue")
+            results_in_queue = r.llen("forceps:results_queue")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.metric("Jobs in Queue", f"{jobs_in_queue:,}")
+            with c2:
+                st.metric("Results in Queue", f"{results_in_queue:,}")
+
+        except Exception as e:
+            st.error(f"Could not connect to Redis: {e}")
+
+    # Search UI
+    st.header("Search")
+    col1, col2 = st.columns([3,1])
+    with col1:
+        nl_query = st.text_input("Natural language query (optional)")
+        tag_query = st.text_input("Filter by tag (optional)", help="Show only images whose tags include this exact term")
+        uploaded = st.file_uploader("Or upload an image for search", type=["jpg","png","jpeg","bmp","gif"])
+        run_search = st.button("Run Search")
+    with col2:
+        st.markdown("**Index readiness**")
+        st.write(f"- Phase 1 (embeddings): {'✅' if st.session_state.phase1_ready else '❌'}")
+        st.write(f"- Phase 2 (captions): {'✅' if st.session_state.phase2_ready else '❌'}")
+        st.write(f"- Ollama: {'available' if ollama_installed() else 'not available'}")
+        if st.session_state.indexing_running:
+            p1_pct = int((st.session_state.p1_done / st.session_state.p1_total) * 100) if st.session_state.p1_total else 0
+            p2_pct = int((st.session_state.p2_done / st.session_state.p2_total) * 100) if st.session_state.p2_total else 0
+            progress1.progress(p1_pct)
+            progress2.progress(p2_pct)
+            phase1_placeholder.text(f"Phase 1: embeddings {p1_pct}% ({st.session_state.p1_done}/{st.session_state.p1_total})")
+            phase2_placeholder.text(f"Phase 2: captions {p2_pct}% ({st.session_state.p2_done}/{st.session_state.p2_total})")
+        if st.session_state.index_error:
+            st.error(st.session_state.index_error)
+        # Stats after indexing
+        if st.session_state.faiss_combined is not None:
+            s = _index_stats(st.session_state.faiss_combined)
+            st.caption(f"Combined index: ntotal={s.get('ntotal',0)}, nlist={s.get('nlist','-')}, pq_m={s.get('pq_m','-')}")
+        if st.session_state.faiss_clip is not None:
+            s = _index_stats(st.session_state.faiss_clip)
+            st.caption(f"CLIP index: ntotal={s.get('ntotal',0)}, nlist={s.get('nlist','-')}, pq_m={s.get('pq_m','-')}")
+        # Timing
+        if st.session_state.phase1_duration is not None:
+            st.caption(f"Phase 1 duration: {st.session_state.phase1_duration:.1f}s")
+        if st.session_state.phase2_duration is not None:
+            st.caption(f"Phase 2 duration: {st.session_state.phase2_duration:.1f}s")
+        if st.session_state.total_index_duration is not None:
+            st.caption(f"Total duration: {st.session_state.total_index_duration:.1f}s")
+
+    results = st.session_state.get("last_results", [])
+    if run_search:
+        results = []
+        vector_results = set()
+        keyword_results = set()
+
+        # 1. Vector Search (FAISS)
+        if nl_query and st.session_state.get("faiss_clip"):
+            q_emb = compute_clip_text_embedding(nl_query, clip_model)
+            _, I = st.session_state.faiss_clip.search(np.array([q_emb], dtype=np.float32), 100)
+            vector_results.update([st.session_state.index_paths[i] for i in I[0] if i != -1])
+        elif uploaded:
+            tmp = Image.open(uploaded).convert("RGB")
+            vit_t = preprocess_vit(tmp).unsqueeze(0)
+            clip_t = (preprocess_clip(tmp).unsqueeze(0) if preprocess_clip is not None else None)
+            q_comb, _ = compute_batch_embeddings([vit_t.squeeze(0)], [clip_t.squeeze(0)] if clip_t is not None else [], vit_model, clip_model)
+            q_emb = q_comb[0].astype(np.float32)
+
+            if st.session_state.get("faiss_combined"):
+                idx_to_use = st.session_state.faiss_combined
+                if st.session_state.get("pca_obj"):
+                    q_emb = st.session_state.pca_obj.apply_py(np.array([q_emb]))[0]
+
+                _, I = idx_to_use.search(np.array([q_emb], dtype=np.float32), 100)
+                vector_results.update([st.session_state.index_paths[i] for i in I[0] if i != -1])
+
+        # 2. Keyword Search (Whoosh)
+        if nl_query and st.session_state.get("whoosh_searcher"):
+            searcher = st.session_state.whoosh_searcher
+            parser = QueryParser("content", schema=searcher.schema)
+            query = parser.parse(nl_query)
+            keyword_hits = searcher.search(query, limit=200)
+            keyword_results.update([hit['path'] for hit in keyword_hits])
+
+        # 3. Combine and Re-rank Results
+        # Simple re-ranking: boost items that appear in both result sets.
+        final_results = []
+        intersection = vector_results.intersection(keyword_results)
+
+        # Add boosted intersection results first
+        final_results.extend(list(intersection))
+
+        # Add remaining vector results
+        final_results.extend([p for p in vector_results if p not in intersection])
+
+        # Add remaining keyword results
+        final_results.extend([p for p in keyword_results if p not in intersection])
+
+        st.session_state.last_results = final_results
+
+    # Apply EXIF filters to current results for display
+    def _exif_for_path(path_str: str):
+        try:
+            p = Path(path_str)
+            fp = fingerprint(p)
+            cached = load_cache(fp) or {}
+            md = cached.get("metadata", {}) if isinstance(cached, dict) else {}
+            exif = md.get("exif") if isinstance(md, dict) else None
+            if not exif:
+                exif = read_exif(p)
+            return exif or {}
+        except Exception:
+            return {}
+
+    display_results = []
+    for r in results:
+        exif = _exif_for_path(r)
+        has_exif = bool(exif)
+        if exif_availability == "With EXIF" and not has_exif:
+            continue
+        if exif_availability == "Without EXIF" and has_exif:
+            continue
+        mk_raw = (exif.get("Make") or "")
+        md_raw = (exif.get("Model") or "")
+        if selected_make_value is not None and mk_raw != selected_make_value:
+            continue
+        if selected_model_value is not None and md_raw != selected_model_value:
+            continue
+        # Filename regex include/exclude
+        fname = Path(r).name
+        if include_re and not include_re.search(fname):
+            continue
+        if exclude_re and exclude_re.search(fname):
+            continue
+        # Modified time filter
+        if use_mtime_filter:
+            try:
+                mtime = Path(r).stat().st_mtime
+                if from_ts is not None and mtime < from_ts:
+                    continue
+                if to_ts is not None and mtime > to_ts:
+                    continue
+            except Exception:
+                continue
+        # Tag filter (exact term)
+        if tag_query:
+            tags = (st.session_state.bookmarks.get(r, {}).get("tags") if r in st.session_state.bookmarks else []) or []
+            if tag_query not in tags:
+                continue
+        display_results.append(r)
+
+    if not results:
+        st.info("Type a natural-language query (requires CLIP) or upload an image.")
+    elif not display_results:
+        st.warning("No results match current filters.")
+
+    if st.session_state.get("last_results") and st.session_state.get("embeddings") is not None:
+        st.markdown("---")
+        st.subheader("Cluster Analysis")
+
+        num_clusters = st.slider("Number of Clusters", min_value=2, max_value=50, value=10)
+
+        if st.button("Cluster Displayed Results"):
+            with st.spinner("Clustering results..."):
+                paths_to_cluster = st.session_state.last_results
+                path_to_idx = {path: i for i, path in enumerate(st.session_state.index_paths)}
+                result_indices = [path_to_idx[p] for p in paths_to_cluster if p in path_to_idx]
+
+                if result_indices:
+                    result_embeddings = st.session_state.embeddings[result_indices]
+
+                    kmeans = MiniBatchKMeans(n_clusters=num_clusters, random_state=0, batch_size=256, n_init='auto')
+                    kmeans.fit(result_embeddings)
+
+                    st.session_state.cluster_labels = {path: label for path, label in zip(paths_to_cluster, kmeans.labels_)}
+                    st.success(f"Successfully clustered results into {num_clusters} groups.")
+                    st.rerun()
+                else:
+                    st.warning("No results to cluster.")
+
+    # ----- Tags page: overview of tags and images -----
+    st.markdown("---")
+    st.subheader("Tags Overview")
+    all_tags = {}
+    for path_str, meta in (st.session_state.bookmarks or {}).items():
+        for t in (meta.get("tags") or []):
+            all_tags.setdefault(t, []).append(path_str)
+
+    if not all_tags:
+        st.caption("No tags yet.")
+    else:
+        # tag selection and display
+        tag_list = sorted(all_tags.keys())
+        sel_tag = st.selectbox("Select a tag to view images", ["(All)"] + tag_list, index=0)
+        cols = st.columns(5)
+        show_paths = []
+        if sel_tag == "(All)":
+            # Flatten unique paths preserving order by tag buckets
+            seen = set()
+            for t in tag_list:
+                for p in all_tags[t]:
+                    if p not in seen:
+                        show_paths.append(p)
+                        seen.add(p)
+        else:
+            show_paths = all_tags.get(sel_tag, [])
+
+        for i, r in enumerate(show_paths[:50]):
+            try:
+                # reuse base64 render to avoid path issues
+                try:
+                    mime, _ = mimetypes.guess_type(r)
+                    mime = mime or "image/jpeg"
+                    with open(r, "rb") as _f:
+                        b64 = base64.b64encode(_f.read()).decode("utf-8")
+                    data_url = f"data:{mime};base64,{b64}"
+                except Exception:
+                    data_url = ""
+                slot = cols[i % 5]
+                slot.markdown(f"<div class='img-card'><img src='{data_url}' /></div>", unsafe_allow_html=True)
+                slot.caption(Path(r).name)
+            except Exception:
+                cols[i % 5].write(Path(r).name)
+
+    def display_image_tile(tile_container, image_path):
+        """Renders a single image tile with all its controls."""
+        r = image_path
+        try:
+            # --- Image Display ---
+            encoded = urllib.parse.quote(r)
+            try:
+                mime, _ = mimetypes.guess_type(r)
+                mime = mime or "image/jpeg"
+                with open(r, "rb") as _f:
+                    b64 = base64.b64encode(_f.read()).decode("utf-8")
+                data_url = f"data:{mime};base64,{b64}"
+            except Exception:
+                data_url = ""
+            tile_container.markdown(f"<div class='img-card'><img src='{data_url}' /></div>", unsafe_allow_html=True)
+            tile_container.caption(Path(r).name)
+
+            # --- Details Expander ---
+            if 'manifest' in st.session_state and r in st.session_state.manifest:
+                with tile_container.expander("Show Details"):
+                    manifest_item = st.session_state.manifest[r]
+                    cached_meta = load_cache(fingerprint(Path(r))) or {}
+
+                    st.code(manifest_item['path'], language='text')
+
+                    st.markdown("**Hashes**")
+                    hashes = manifest_item.get('hashes', {})
+                    if hashes:
+                        for hash_name, hash_value in hashes.items():
+                            st.text(f"{hash_name.upper()}: {hash_value}")
+
+                    st.markdown("**EXIF Data**")
+                    exif_data = cached_meta.get("metadata", {}).get("exif", {})
+                    if exif_data:
+                        for key, value in exif_data.items():
+                            st.text(f"{key}: {value}")
+
+                    st.markdown("**AI Caption**")
+                    caption = cached_meta.get("metadata", {}).get("caption")
+                    st.text(caption or "Not available.")
+
+            # --- Bookmark/Tags Expander ---
+            def _is_bm(pth: str) -> bool:
+                return pth in (st.session_state.get("bookmarks", {}) or {})
+
+            def _save_bms():
+                case_dir = Path(st.session_state.cases_dir) / st.session_state.selected_case
+                save_bookmarks(st.session_state.bookmarks, case_dir)
+
+            with tile_container.expander("Manage Bookmark"):
+                is_bookmarked = _is_bm(r)
+
+                if st.checkbox("Bookmarked", value=is_bookmarked, key=f"bm_check_{r}"):
+                    if not is_bookmarked:
+                        st.session_state.bookmarks[r] = st.session_state.bookmarks.get(r, {"tags": [], "notes": "", "added_ts": time.time()})
+                        _save_bms()
+                        st.rerun()
+
+                    bookmark_data = st.session_state.bookmarks.get(r, {})
+
+                    existing_tags = "\n".join(bookmark_data.get("tags", []))
+                    new_tags_str = st.text_area("Tags (one per line)", value=existing_tags, key=f"tags_{r}")
+
+                    existing_notes = bookmark_data.get("notes", "")
+                    new_notes = st.text_area("Notes", value=existing_notes, key=f"notes_{r}")
+
+                    if st.button("Save Bookmark Details", key=f"save_bm_{r}"):
+                        st.session_state.bookmarks[r]['tags'] = [t.strip() for t in new_tags_str.split("\n") if t.strip()]
+                        st.session_state.bookmarks[r]['notes'] = new_notes
+                        _save_bms()
+                        st.success("Bookmark updated!")
+
+                elif is_bookmarked:
+                    st.session_state.bookmarks.pop(r, None)
+                    _save_bms()
+                    st.rerun()
+        except Exception as e:
+            tile_container.error(f"Error: {e}")
+            tile_container.write(Path(r).name)
+
+
+    if display_results:
+        st.markdown("### Top results")
+
+        # If results have been clustered, group them
+        if 'cluster_labels' in st.session_state:
+            clusters = {}
+            for path in display_results:
+                label = st.session_state.cluster_labels.get(path)
+                if label is not None:
+                    if label not in clusters:
+                        clusters[label] = []
+                    clusters[label].append(path)
+
+            if st.button("Clear Clustering"):
+                del st.session_state['cluster_labels']
+                st.rerun()
+
+            for label, paths in sorted(clusters.items()):
+                st.markdown(f"--- \n#### Cluster {label+1} ({len(paths)} images)")
+                cols = st.columns(5)
+                for i, r in enumerate(paths):
+                    display_image_tile(cols[i%5], r)
+        else:
+            # Original, unclustered display
+            cols = st.columns(5)
+            for i, r in enumerate(display_results[:25]):
+                display_image_tile(cols[i%5], r)
+
+with reporting_tab:
+    st.header("Case Report Generator")
+    st.info("This section allows you to review bookmarked items and generate a final PDF report.")
+
+    if not st.session_state.get("bookmarks"):
+        st.warning("No bookmarks in the current case to report.")
+    else:
+        st.subheader("Bookmarked Items")
+
+        # Display a table of bookmarked items
+        for path, data in st.session_state.bookmarks.items():
+            with st.expander(f"{Path(path).name}"):
+                st.image(path, width=150)
+                st.text(f"Path: {path}")
+                st.text(f"Tags: {', '.join(data.get('tags', []))}")
+                st.text_area("Notes", value=data.get('notes', ''), height=100, disabled=True, key=f"notes_report_{path}")
+
+        # Generate report button
+        st.subheader("Generate Report")
+        if st.button("Generate PDF Report"):
+            with st.spinner("Generating PDF..."):
+                # The PDF generation function is already updated to handle the new data structure
+                pdf_data = generate_bookmarks_pdf(st.session_state.bookmarks)
+                st.download_button(
+                    label="Download PDF Report",
+                    data=pdf_data,
+                    file_name=f"case_report_{st.session_state.get('selected_case', 'current')}.pdf",
+                    mime="application/pdf"
+                )
 cases_dir_path = st.sidebar.text_input("Cases Directory", value="output_index")
 st.session_state.cases_dir = cases_dir_path
 

@@ -1,0 +1,22 @@
++----------------------------------------------------------------------------------------------------------------------+
+| [FORCEPS] Forensic Optimized Retrieval & Clustering of Evidence via Perceptual Search                                |
++----------------------------------------------------------------------------------------------------------------------+
+| [ Sidebar ]                                        | [ Search & Results ]  [ Reporting ]                               |
+|                                                    |-------------------------------------------------------------------+
+| [FORCEPS Indexing Controls]                        | [Search]                                                          |
+|  Folder to index: [ /path/to/images      ]         |  Natural language query: [ a dog near a red car          ]         |
+|  [ Start Indexing Job ]                            |  [ Run Search ]                                                   |
+|                                                    |                                                                   |
+| [Backend Controls]                                 | [Top results]                                                     |
+|  Redis Host: [ localhost ]                         |  +----------------+  +----------------+  +----------------+       |
+|  Redis Port: [ 6379      ]                         |  | [Image]        |  | [Image]        |  | [Image]        |       |
+|                                                    |  | img_001.jpg    |  | img_002.jpg    |  | ...            |       |
+| [Load Case for Searching]                          |  | [Show Details]v|  | [Show Details]v|  | [Show Details]v|       |
+|  Cases Directory: [ output_index ]                 |  | [Manage Bkmk]v |  | [Manage Bkmk]v |  | [Manage Bkmk]v |       |
+|  Select Case: [ case-001                v]         |  +----------------+  +----------------+  +----------------+       |
+|  [ Load Selected Case ]                            |                                                                   |
+|                                                    | ---                                                               |
+|                                                    | [Cluster Analysis]                                                |
+|                                                    |  Number of Clusters: [ 2 ----o--------------- 50 ] (10)           |
+|                                                    |  [ Cluster Displayed Results ]                                    |
++----------------------------------------------------------------------------------------------------------------------+
