@@ -432,13 +432,32 @@ if st.session_state.get("case_type") == "triage" and selected_count > 0:
                     # 4. Enqueue the job (as a single batch)
                     r.rpush(cfg_redis['job_queue'], json.dumps(job_data))
 
-                    # 5. Provide feedback and next steps
-                    st.sidebar.success(f"Successfully enqueued {len(job_data)} items for indexing.")
-                    st.sidebar.info(f"A new case will be created as '{new_case_name}'.")
-                    st.sidebar.warning("To finalize, run the index builder from your terminal with the new case name:")
-                    st.sidebar.code(f"python3 app/build_index.py --case_name \"{new_case_name}\"")
+                    # 5. Launch the index builder as a background process
+                    st.sidebar.info("Launching background index builder...")
+                    command = [
+                        sys.executable,
+                        str(Path(__file__).parent / "build_index.py"),
+                        "--case_name",
+                        new_case_name,
+                        "--mode",
+                        "full"
+                    ]
+                    process = subprocess.Popen(
+                        command,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, # Combine stdout and stderr
+                        text=True,
+                        encoding='utf-8',
+                        bufsize=1 # Line-buffered
+                    )
+                    st.session_state.indexer_process = process
 
-                    # Clear the selection
+                    # 6. Provide feedback and next steps
+                    st.sidebar.success(f"Enqueued {len(job_data)} items for indexing.")
+                    st.sidebar.success(f"Indexer for '{new_case_name}' started (PID: {process.pid}).")
+                    st.sidebar.warning("Monitor progress in the 'Process Logs' tab.")
+
+                    # Clear the selection and rerun to update UI
                     st.session_state.selected_items = set()
                     st.rerun()
 
@@ -686,7 +705,56 @@ if save_idx_btn:
         st.error("No index to save yet.")
 
 # Main app layout
-search_tab, reporting_tab = st.tabs(["Search & Results", "Reporting"])
+search_tab, reporting_tab, logs_tab = st.tabs(["Search & Results", "Reporting", "Process Logs"])
+
+with logs_tab:
+    st.header("Background Process Logs")
+
+    # This function will run in a separate thread to read logs without blocking the UI
+    def log_reader_thread(process, buffer):
+        try:
+            for line in iter(process.stdout.readline, ''):
+                buffer.append(line)
+            process.stdout.close()
+        except Exception as e:
+            buffer.append(f"\n--- Log reader error: {e} ---\n")
+
+    # Check if a process is running
+    if "indexer_process" in st.session_state and st.session_state.indexer_process:
+        proc = st.session_state.indexer_process
+
+        # Start the log reader thread if it's not already running for this process
+        if "log_reader_thread" not in st.session_state or not st.session_state.log_reader_thread.is_alive():
+            st.session_state.log_buffer = []
+            thread = threading.Thread(
+                target=log_reader_thread,
+                args=(proc, st.session_state.log_buffer),
+                daemon=True
+            )
+            thread.start()
+            st.session_state.log_reader_thread = thread
+
+        # Display the logs from the buffer
+        if "log_buffer" in st.session_state:
+            st.code("".join(st.session_state.log_buffer), language="log")
+
+        # Check if the process has finished
+        if proc.poll() is not None:
+            return_code = proc.poll()
+            if return_code == 0:
+                st.success(f"Indexer process (PID: {proc.pid}) finished successfully.")
+            else:
+                st.error(f"Indexer process (PID: {proc.pid}) failed with exit code: {return_code}.")
+            # Clean up session state
+            st.session_state.indexer_process = None
+            st.session_state.log_reader_thread = None
+        else:
+            st.info(f"Monitoring indexer process (PID: {proc.pid})...")
+            time.sleep(1) # Auto-refresh the log view
+            st.rerun()
+    else:
+        st.info("No background processes are currently running.")
+
 
 with search_tab:
     st.header("Backend Monitoring")
