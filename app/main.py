@@ -166,6 +166,13 @@ if "phase2_status" not in st.session_state:
     st.session_state.phase2_status = "idle"
 if "index_error" not in st.session_state:
     st.session_state.index_error = None
+if "redis_host" not in st.session_state:
+    st.session_state.redis_host = os.environ.get("REDIS_HOST", "127.0.0.1")
+if "redis_port" not in st.session_state:
+    try:
+        st.session_state.redis_port = int(os.environ.get("REDIS_PORT", "6379"))
+    except Exception:
+        st.session_state.redis_port = 6379
 
 def _get_query_params_compat():
     try:
@@ -622,7 +629,7 @@ search_tab, reporting_tab = st.tabs(["Search & Results", "Reporting"])
 
 with search_tab:
     st.header("Backend Monitoring")
-    if st.button("Refresh Queue Stats"):
+    if st.button("Refresh Queue Stats", key="refresh_q_top"):
         try:
             r = redis.Redis(host=st.session_state.redis_host, port=st.session_state.redis_port, db=0)
             jobs_in_queue = r.llen("forceps:job_queue")
@@ -641,10 +648,10 @@ with search_tab:
     st.header("Search")
     col1, col2 = st.columns([3,1])
     with col1:
-        nl_query = st.text_input("Natural language query (optional)")
-        tag_query = st.text_input("Filter by tag (optional)", help="Show only images whose tags include this exact term")
-        uploaded = st.file_uploader("Or upload an image for search", type=["jpg","png","jpeg","bmp","gif"])
-        run_search = st.button("Run Search")
+        nl_query = st.text_input("Natural language query (optional)", key="nl_query_top")
+        tag_query = st.text_input("Filter by tag (optional)", help="Show only images whose tags include this exact term", key="tag_query_top")
+        uploaded = st.file_uploader("Or upload an image for search", type=["jpg","png","jpeg","bmp","gif"], key="uploader_top")
+        run_search = st.button("Run Search", key="run_search_top")
     with col2:
         st.markdown("**Index readiness**")
         st.write(f"- Phase 1 (embeddings): {'✅' if st.session_state.phase1_ready else '❌'}")
@@ -786,7 +793,7 @@ with search_tab:
 
         num_clusters = st.slider("Number of Clusters", min_value=2, max_value=50, value=10)
 
-        if st.button("Cluster Displayed Results"):
+        if st.button("Cluster Displayed Results", key="cluster_top"):
             with st.spinner("Clustering results..."):
                 paths_to_cluster = st.session_state.last_results
                 path_to_idx = {path: i for i, path in enumerate(st.session_state.index_paths)}
@@ -942,7 +949,7 @@ with search_tab:
                         clusters[label] = []
                     clusters[label].append(path)
 
-            if st.button("Clear Clustering"):
+            if st.button("Clear Clustering", key="clear_cluster_top"):
                 del st.session_state['cluster_labels']
                 st.rerun()
 
@@ -1069,7 +1076,7 @@ else:
 
 
 st.header("Backend Monitoring")
-if st.button("Refresh Queue Stats"):
+if st.button("Refresh Queue Stats", key="refresh_q_bottom"):
     try:
         r = redis.Redis(host=st.session_state.redis_host, port=st.session_state.redis_port, db=0)
         jobs_in_queue = r.llen("forceps:job_queue")
@@ -1088,10 +1095,10 @@ if st.button("Refresh Queue Stats"):
 st.header("Search")
 col1, col2 = st.columns([3,1])
 with col1:
-    nl_query = st.text_input("Natural language query (optional)")
-    tag_query = st.text_input("Filter by tag (optional)", help="Show only images whose tags include this exact term")
-    uploaded = st.file_uploader("Or upload an image for search", type=["jpg","png","jpeg","bmp","gif"])
-    run_search = st.button("Run Search")
+    nl_query = st.text_input("Natural language query (optional)", key="nl_query_bottom")
+    tag_query = st.text_input("Filter by tag (optional)", help="Show only images whose tags include this exact term", key="tag_query_bottom")
+    uploaded = st.file_uploader("Or upload an image for search", type=["jpg","png","jpeg","bmp","gif"], key="uploader_bottom")
+    run_search = st.button("Run Search", key="run_search_bottom")
 with col2:
     st.markdown("**Index readiness**")
     st.write(f"- Phase 1 (embeddings): {'✅' if st.session_state.phase1_ready else '❌'}")
@@ -1389,9 +1396,9 @@ if display_results:
                     clusters[label] = []
                 clusters[label].append(path)
 
-        if st.button("Clear Clustering"):
-            del st.session_state['cluster_labels']
-            st.rerun()
+            if st.button("Clear Clustering", key="clear_cluster_bottom"):
+                del st.session_state['cluster_labels']
+                st.rerun()
 
         for label, paths in sorted(clusters.items()):
             st.markdown(f"--- \n#### Cluster {label+1} ({len(paths)} images)")

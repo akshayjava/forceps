@@ -78,6 +78,24 @@ def read_exif(path: Path):
     except Exception:
         return {}
 
+# Backwards-compat: expose compute_perceptual_hashes here for callers expecting it
+def compute_perceptual_hashes(path: Path) -> Dict[str, Any]:
+    try:
+        # Prefer dedicated hasher module if available
+        from app.hashers.perceptual import compute_perceptual_hashes as _compute
+        return _compute(path)
+    except Exception:
+        # Fallback inline computation
+        try:
+            im = Image.open(path).convert("RGB")
+            return {
+                "phash": str(imagehash.phash(im)),
+                "ahash": str(imagehash.average_hash(im)),
+                "dhash": str(imagehash.dhash(im)),
+            }
+        except Exception:
+            return {"phash": None, "ahash": None, "dhash": None}
+
 # ---------------- Bookmarks helpers ----------------
 def load_bookmarks(case_dir: Path) -> Dict[str, Dict[str, Any]]:
     """Load bookmarks mapping from image path -> {tags: List[str], added_ts: float}.

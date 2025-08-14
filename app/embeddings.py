@@ -81,3 +81,18 @@ def compute_clip_text_embedding(text, clip_model):
         emb = clip_model.encode_text(token).cpu().float().numpy()
     emb = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-10)
     return emb[0]
+
+def preprocess_image_for_vit_clip(image_path, preprocess_vit, preprocess_clip):
+    """Load an image from path and return tensors for ViT and CLIP.
+
+    Returns:
+        (path_str, pil_image, vit_tensor, clip_tensor_or_none) or None on failure
+    """
+    try:
+        path_str = str(image_path)
+        img = Image.open(path_str).convert("RGB")
+        vit_tensor = preprocess_vit(img)
+        clip_tensor = preprocess_clip(img) if preprocess_clip is not None else None
+        return path_str, img, vit_tensor, clip_tensor
+    except Exception:
+        return None
