@@ -60,6 +60,7 @@ from app.utils import (
     generate_bookmarks_csv,
     generate_bookmarks_pdf,
     _gather_metadata_for_path,
+    hamming_distance,
 )
 from app.llm_ollama import ollama_installed, generate_caption_ollama, model_available
 
@@ -166,6 +167,10 @@ if "phase2_status" not in st.session_state:
     st.session_state.phase2_status = "idle"
 if "index_error" not in st.session_state:
     st.session_state.index_error = None
+if "case_type" not in st.session_state:
+    st.session_state.case_type = None # Can be 'full' or 'triage'
+if "search_distances" not in st.session_state:
+    st.session_state.search_distances = {}
 
 def _get_query_params_compat():
     try:
@@ -641,10 +646,49 @@ with search_tab:
     st.header("Search")
     col1, col2 = st.columns([3,1])
     with col1:
-        nl_query = st.text_input("Natural language query (optional)")
-        tag_query = st.text_input("Filter by tag (optional)", help="Show only images whose tags include this exact term")
-        uploaded = st.file_uploader("Or upload an image for search", type=["jpg","png","jpeg","bmp","gif"])
-        run_search = st.button("Run Search")
+        # Define search variables that will be used by the logic later
+        run_search = False
+        nl_query = None
+        uploaded = None
+        hash_type = None
+        hash_value = None
+        hamming_distance = 0
+
+        # Conditionally display the search UI based on the loaded case type
+        if st.session_state.get("case_type") == "full":
+            st.subheader("Hybrid Search (Vector + Keyword)")
+            nl_query = st.text_input("Natural language query", key="nl_query", help="Use natural language for semantic search or keywords for text search.")
+            uploaded = st.file_uploader("Image similarity search", type=["jpg","png","jpeg","bmp","gif"], key="img_upload")
+            if st.button("Run Full Search", key="run_full_search"):
+                run_search = True
+
+        elif st.session_state.get("case_type") == "triage":
+            st.subheader("Triage Search (Hash Matching)")
+
+            available_hashes = []
+            if st.session_state.get("manifest"):
+                first_item = next(iter(st.session_state.manifest.values()), None)
+                if first_item and isinstance(first_item.get('hashes'), dict):
+                    available_hashes = sorted(list(first_item['hashes'].keys()))
+
+            if not available_hashes:
+                st.warning("No hashes found in the manifest for this case.")
+            else:
+                hash_type = st.selectbox("Hash Type", options=available_hashes, key="hash_type")
+                hash_value = st.text_input("Hash Value to Match", key="hash_value")
+
+                is_perceptual = 'hash' in (hash_type or '').lower() and 'sha' not in (hash_type or '').lower()
+                if is_perceptual:
+                    hamming_distance = st.slider("Max Hamming Distance", 0, 64, 8, key="hamming_dist", help="Finds images with perceptually similar hashes within this distance.")
+
+                if st.button("Run Hash Search", key="run_hash_search"):
+                    run_search = True
+
+        else:
+            st.info("Load a case from the sidebar to begin searching.")
+
+        # Shared filter for tags, available in both modes
+        tag_query = st.text_input("Filter results by tag", help="Show only images whose tags include this exact term.", key="tag_query")
     with col2:
         st.markdown("**Index readiness**")
         st.write(f"- Phase 1 (embeddings): {'✅' if st.session_state.phase1_ready else '❌'}")
@@ -676,53 +720,77 @@ with search_tab:
 
     results = st.session_state.get("last_results", [])
     if run_search:
-        results = []
-        vector_results = set()
-        keyword_results = set()
+        results = [] # Start with an empty list for new search results
+        st.session_state.search_distances = {} # Clear old distances
 
-        # 1. Vector Search (FAISS)
-        if nl_query and st.session_state.get("faiss_clip"):
-            q_emb = compute_clip_text_embedding(nl_query, clip_model)
-            _, I = st.session_state.faiss_clip.search(np.array([q_emb], dtype=np.float32), 100)
-            vector_results.update([st.session_state.index_paths[i] for i in I[0] if i != -1])
-        elif uploaded:
-            tmp = Image.open(uploaded).convert("RGB")
-            vit_t = preprocess_vit(tmp).unsqueeze(0)
-            clip_t = (preprocess_clip(tmp).unsqueeze(0) if preprocess_clip is not None else None)
-            q_comb, _ = compute_batch_embeddings([vit_t.squeeze(0)], [clip_t.squeeze(0)] if clip_t is not None else [], vit_model, clip_model)
-            q_emb = q_comb[0].astype(np.float32)
+        # --- Full Mode Search Logic ---
+        if st.session_state.get("case_type") == "full":
+            vector_results = set()
+            keyword_results = set()
 
-            if st.session_state.get("faiss_combined"):
-                idx_to_use = st.session_state.faiss_combined
-                if st.session_state.get("pca_obj"):
-                    q_emb = st.session_state.pca_obj.apply_py(np.array([q_emb]))[0]
-
-                _, I = idx_to_use.search(np.array([q_emb], dtype=np.float32), 100)
+            # 1. Vector Search (FAISS)
+            if nl_query and st.session_state.get("faiss_clip"):
+                q_emb = compute_clip_text_embedding(nl_query, clip_model)
+                _, I = st.session_state.faiss_clip.search(np.array([q_emb], dtype=np.float32), 100)
                 vector_results.update([st.session_state.index_paths[i] for i in I[0] if i != -1])
+            elif uploaded:
+                tmp = Image.open(uploaded).convert("RGB")
+                vit_t = preprocess_vit(tmp).unsqueeze(0)
+                clip_t = (preprocess_clip(tmp).unsqueeze(0) if preprocess_clip is not None else None)
+                q_comb, _ = compute_batch_embeddings([vit_t.squeeze(0)], [clip_t.squeeze(0)] if clip_t is not None else [], vit_model, clip_model)
+                q_emb = q_comb[0].astype(np.float32)
 
-        # 2. Keyword Search (Whoosh)
-        if nl_query and st.session_state.get("whoosh_searcher"):
-            searcher = st.session_state.whoosh_searcher
-            parser = QueryParser("content", schema=searcher.schema)
-            query = parser.parse(nl_query)
-            keyword_hits = searcher.search(query, limit=200)
-            keyword_results.update([hit['path'] for hit in keyword_hits])
+                if st.session_state.get("faiss_combined"):
+                    idx_to_use = st.session_state.faiss_combined
+                    if st.session_state.get("pca_obj"):
+                        q_emb = st.session_state.pca_obj.apply_py(np.array([q_emb]))[0]
 
-        # 3. Combine and Re-rank Results
-        # Simple re-ranking: boost items that appear in both result sets.
-        final_results = []
-        intersection = vector_results.intersection(keyword_results)
+                    _, I = idx_to_use.search(np.array([q_emb], dtype=np.float32), 100)
+                    vector_results.update([st.session_state.index_paths[i] for i in I[0] if i != -1])
 
-        # Add boosted intersection results first
-        final_results.extend(list(intersection))
+            # 2. Keyword Search (Whoosh)
+            if nl_query and st.session_state.get("whoosh_searcher"):
+                searcher = st.session_state.whoosh_searcher
+                parser = QueryParser("content", schema=searcher.schema)
+                query = parser.parse(nl_query)
+                keyword_hits = searcher.search(query, limit=200)
+                keyword_results.update([hit['path'] for hit in keyword_hits])
 
-        # Add remaining vector results
-        final_results.extend([p for p in vector_results if p not in intersection])
+            # 3. Combine and Re-rank Results
+            intersection = vector_results.intersection(keyword_results)
+            final_results = list(intersection)
+            final_results.extend([p for p in vector_results if p not in intersection])
+            final_results.extend([p for p in keyword_results if p not in intersection])
+            results = final_results
 
-        # Add remaining keyword results
-        final_results.extend([p for p in keyword_results if p not in intersection])
+        # --- Triage Mode Search Logic ---
+        elif st.session_state.get("case_type") == "triage":
+            hash_results_with_dist = []
+            if hash_type and hash_value and st.session_state.get("manifest"):
+                is_perceptual = 'hash' in (hash_type or '').lower() and 'sha' not in (hash_type or '').lower()
 
-        st.session_state.last_results = final_results
+                with st.spinner(f"Searching by {hash_type}..."):
+                    for path, item in st.session_state.manifest.items():
+                        item_hashes = item.get('hashes', {})
+                        if not item_hashes: continue
+
+                        target_hash = item_hashes.get(hash_type)
+                        if not target_hash: continue
+
+                        if is_perceptual:
+                            dist = hamming_distance(hash_value, target_hash)
+                            if dist <= hamming_distance:
+                                hash_results_with_dist.append((path, dist))
+                        else:  # Exact match
+                            if hash_value.lower() == target_hash.lower():
+                                hash_results_with_dist.append((path, 0))
+
+                # Sort results: exact matches first, then by hamming distance
+                hash_results_with_dist.sort(key=lambda x: x[1])
+                results = [path for path, dist in hash_results_with_dist]
+                st.session_state.search_distances = {path: dist for path, dist in hash_results_with_dist}
+
+        st.session_state.last_results = results
 
     # Apply EXIF filters to current results for display
     def _exif_for_path(path_str: str):
@@ -863,7 +931,13 @@ with search_tab:
             except Exception:
                 data_url = ""
             tile_container.markdown(f"<div class='img-card'><img src='{data_url}' /></div>", unsafe_allow_html=True)
-            tile_container.caption(Path(r).name)
+
+            # Display filename and Hamming distance if available
+            caption_text = Path(r).name
+            dist = st.session_state.get("search_distances", {}).get(r)
+            if dist is not None and dist > 0:
+                caption_text += f" (dist: {dist})"
+            tile_container.caption(caption_text)
 
             # --- Details Expander ---
             if 'manifest' in st.session_state and r in st.session_state.manifest:
@@ -986,6 +1060,17 @@ with reporting_tab:
                     file_name=f"case_report_{st.session_state.get('selected_case', 'current')}.pdf",
                     mime="application/pdf"
                 )
+def reset_case_state():
+    """Clears all session state related to a loaded case."""
+    keys_to_reset = [
+        "faiss_combined", "faiss_clip", "pca_obj", "manifest", "index_paths",
+        "whoosh_searcher", "embeddings", "bookmarks", "case_type", "last_results",
+        "cluster_labels"
+    ]
+    for key in keys_to_reset:
+        if key in st.session_state:
+            st.session_state[key] = None
+
 cases_dir_path = st.sidebar.text_input("Cases Directory", value="output_index")
 st.session_state.cases_dir = cases_dir_path
 
@@ -1004,68 +1089,64 @@ else:
     st.session_state.selected_case = selected_case
 
     if st.sidebar.button("Load Selected Case"):
+        reset_case_state() # Clear previous case data
         index_dir = Path(st.session_state.cases_dir) / st.session_state.selected_case
-        st.sidebar.info(f"Loading from: {index_dir}")
+        st.sidebar.info(f"Loading case: {st.session_state.selected_case}")
+
         try:
-            if not index_dir.is_dir():
-                st.error(f"Case directory not found: {index_dir}")
+            # A case MUST have a manifest.json file. This is the source of truth.
+            manifest_path = index_dir / "manifest.json"
+            if not manifest_path.exists():
+                st.error(f"Case is invalid: manifest.json not found in {index_dir}")
             else:
-                # Load main index
+                with open(manifest_path, "r") as f:
+                    manifest_data = json.load(f)
+                st.session_state.manifest = {item['path']: item for item in manifest_data}
+                st.session_state.index_paths = [item['path'] for item in manifest_data]
+                st.success(f"Loaded manifest for {len(st.session_state.index_paths)} images.")
+
+                # Now, conditionally load all other assets if they exist.
+                # This determines if the case is 'full' or 'triage'.
+
+                # Vector Indexes (FAISS)
                 combined_idx_path = index_dir / "combined.index"
                 if combined_idx_path.exists():
                     st.session_state.faiss_combined = faiss.read_index(str(combined_idx_path))
-                    st.success("Loaded combined index.")
+                    st.session_state.case_type = "full" # This is a full-featured case
+                    st.success("Loaded 'full' case with vector index.")
                 else:
-                     st.error("combined.index not found in directory.")
+                    st.session_state.case_type = "triage"
+                    st.warning("Loaded 'triage' case. Vector search will be disabled.")
 
-                # Load manifest
-                manifest_path = index_dir / "manifest.json"
-                if manifest_path.exists():
-                    with open(manifest_path, "r") as f:
-                        manifest_data = json.load(f)
-                    # Create a map for easy lookup
-                    st.session_state.manifest = {item['path']: item for item in manifest_data}
-                    # Keep the ordered list of paths for indexing
-                    st.session_state.index_paths = [item['path'] for item in manifest_data]
-                    st.success(f"Loaded manifest for {len(st.session_state.index_paths)} images.")
-                else:
-                    st.error("manifest.json not found in directory.")
-
-                # Load optional clip index
                 clip_idx_path = index_dir / "clip.index"
                 if clip_idx_path.exists():
                     st.session_state.faiss_clip = faiss.read_index(str(clip_idx_path))
-                    st.success("Loaded CLIP index.")
 
-                # Load optional PCA matrix
+                # PCA Matrix
                 pca_path = index_dir / "pca.matrix.pkl"
                 if pca_path.exists():
                     with open(pca_path, "rb") as f:
                         st.session_state.pca_obj = pickle.load(f)
-                    st.success("Loaded PCA matrix.")
 
-                # Load bookmarks for the case
+                # Text Index (Whoosh)
+                whoosh_path = index_dir / "whoosh_index"
+                if whoosh_path.exists():
+                    whoosh_ix = open_whoosh_dir(str(whoosh_path))
+                    st.session_state.whoosh_searcher = whoosh_ix.searcher()
+
+                # Embeddings file for clustering
+                embeddings_path = index_dir / "embeddings_combined.mmap"
+                if embeddings_path.exists() and st.session_state.faiss_combined:
+                    num_embeddings = len(st.session_state.index_paths)
+                    embedding_dim = st.session_state.faiss_combined.d
+                    st.session_state.embeddings = np.memmap(embeddings_path, dtype='float32', mode='r', shape=(num_embeddings, embedding_dim))
+
+                # Bookmarks are always loaded
                 st.session_state.bookmarks = load_bookmarks(index_dir)
                 st.success(f"Loaded {len(st.session_state.bookmarks)} bookmarks.")
-
-            # Load Whoosh index
-            whoosh_path = index_dir / "whoosh_index"
-            if whoosh_path.exists():
-                whoosh_ix = open_whoosh_dir(str(whoosh_path))
-                st.session_state.whoosh_searcher = whoosh_ix.searcher()
-                st.success("Loaded text index searcher.")
-
-            # Load embeddings for clustering
-            embeddings_path = index_dir / "embeddings_combined.mmap"
-            if embeddings_path.exists() and 'manifest' in st.session_state:
-                num_embeddings = len(st.session_state.index_paths)
-                # This is a bit of a hack, we need to get the dimension from the faiss index
-                embedding_dim = st.session_state.faiss_combined.d
-                st.session_state.embeddings = np.memmap(embeddings_path, dtype='float32', mode='r', shape=(num_embeddings, embedding_dim))
-                st.success(f"Memory-mapped {num_embeddings} embeddings for clustering.")
-
         except Exception as e:
-            st.error(f"Failed to load index files: {e}")
+            st.error(f"An error occurred while loading the case: {e}")
+            reset_case_state() # Clean up on failure
 
 
 st.header("Backend Monitoring")
