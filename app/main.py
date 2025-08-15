@@ -174,6 +174,18 @@ if "redis_port" not in st.session_state:
     except Exception:
         st.session_state.redis_port = 6379
 
+# Sidebar: Redis connection settings
+st.sidebar.markdown("### Redis Settings")
+st.session_state.redis_host = st.sidebar.text_input("Redis host", value=st.session_state.redis_host, key="redis_host_input")
+st.session_state.redis_port = st.sidebar.number_input("Redis port", min_value=1, max_value=65535, value=int(st.session_state.redis_port), step=1, key="redis_port_input")
+if st.sidebar.button("Test Redis connection", key="test_redis_conn"):
+    try:
+        r = redis.Redis(host=st.session_state.redis_host, port=int(st.session_state.redis_port), db=0)
+        r.ping()
+        st.sidebar.success(f"Connected to Redis at {st.session_state.redis_host}:{st.session_state.redis_port}")
+    except Exception as e:
+        st.sidebar.error(f"Redis connection failed: {e}")
+
 def _get_query_params_compat():
     try:
         # Newer Streamlit
@@ -310,50 +322,22 @@ except Exception:
 # Sidebar controls
 st.sidebar.header("FORCEPS Indexing Controls")
 
-_inp = st.sidebar.text_input("Folder to index", value=st.session_state.folder_path, key="folder_input")
-if _inp and _inp != st.session_state.folder_path:
-    st.session_state.folder_path = _inp
-
-with st.sidebar.expander("Folder picker", expanded=False):
-    # OS-native picker (best-effort)
-    log_area = st.empty()
-    if st.button("Use OS file picker…"):
+col_path, col_btn = st.sidebar.columns([0.75, 0.25])
+with col_path:
+    _inp = st.text_input("Folder to index", value=st.session_state.folder_path, key="folder_input")
+    if _inp and _inp != st.session_state.folder_path:
+        st.session_state.folder_path = _inp
+with col_btn:
+    if st.button("Browse…", key="os_picker_blocking"):
         sel, logs = _choose_folder_os()
         if sel:
             st.session_state.folder_path = sel
             st.session_state.browse_dir = sel
             st.rerun()
         else:
-            st.warning("OS file picker unavailable or canceled. Use the navigator below.")
-            if logs:
-                with log_area:
-                    st.code("\n".join(logs), language="text")
+            st.sidebar.warning("OS file picker unavailable or canceled.")
 
-    def list_subdirs(p: Path):
-        try:
-            return [d for d in sorted(p.iterdir()) if d.is_dir()]
-        except Exception:
-            return []
-    cur = Path(st.session_state.browse_dir)
-    st.caption(f"Current: {cur}")
-    c1, c2 = st.columns([1,1])
-    with c1:
-        if cur.parent != cur and st.button("Up one level"):
-            st.session_state.browse_dir = str(cur.parent)
-            st.rerun()
-    with c2:
-        if st.button("Use this folder"):
-            st.session_state.folder_path = str(cur)
-            st.rerun()
-    subs = list_subdirs(cur)
-    names = [d.name for d in subs]
-    if names:
-        sel = st.selectbox("Open subfolder", names, index=0, key="browse_sel")
-        if st.button("Open"):
-            st.session_state.browse_dir = str(cur / sel)
-            st.rerun()
-    else:
-        st.caption("No subfolders here.")
+## Removed inline folder browser; OS-native picker only
 folder = st.session_state.folder_path
 start_btn = st.sidebar.button("Start Two-Phase Indexing")
 stop_btn = st.sidebar.button("Cancel Background Tasks")
@@ -654,13 +638,45 @@ with search_tab:
         run_search = st.button("Run Search", key="run_search_top")
     with col2:
         st.markdown("**Index readiness**")
+        # Update phase flags from Redis stats if available
+        try:
+            import redis as _r
+            rc = _r.Redis(host=st.session_state.redis_host, port=st.session_state.redis_port, db=0)
+            total = int(rc.get("forceps:stats:total_images") or 0)
+            done = int(rc.get("forceps:stats:embeddings_done") or 0)
+            if total > 0 and done >= total:
+                st.session_state.phase1_ready = True
+        except Exception:
+            pass
         st.write(f"- Phase 1 (embeddings): {'✅' if st.session_state.phase1_ready else '❌'}")
         st.write(f"- Phase 2 (captions): {'✅' if st.session_state.phase2_ready else '❌'}")
         st.write(f"- Ollama: {'available' if ollama_installed() else 'not available'}")
         if st.session_state.indexing_running:
             p1_pct = int((st.session_state.p1_done / st.session_state.p1_total) * 100) if st.session_state.p1_total else 0
             p2_pct = int((st.session_state.p2_done / st.session_state.p2_total) * 100) if st.session_state.p2_total else 0
+            # Try to show real-time progress from Redis if available
+            try:
+                import redis as _r
+                rc = _r.Redis(host=st.session_state.redis_host, port=st.session_state.redis_port, db=0)
+                total = int(rc.get("forceps:stats:total_images") or 0)
+                done = int(rc.get("forceps:stats:embeddings_done") or 0)
+                if total > 0:
+                    p1_pct = min(100, int(done * 100 / total))
+            except Exception:
+                pass
             progress1.progress(p1_pct)
+            # Phase 2 captions progress from Redis if available
+            try:
+                import redis as _r
+                rc = _r.Redis(host=st.session_state.redis_host, port=st.session_state.redis_port, db=0)
+                total = int(rc.get("forceps:stats:total_images") or 0)
+                done2 = int(rc.get("forceps:stats:captions_done") or 0)
+                if total > 0:
+                    p2_pct = min(100, int(done2 * 100 / total))
+                    if done2 >= total:
+                        st.session_state.phase2_ready = True
+            except Exception:
+                pass
             progress2.progress(p2_pct)
             phase1_placeholder.text(f"Phase 1: embeddings {p1_pct}% ({st.session_state.p1_done}/{st.session_state.p1_total})")
             phase2_placeholder.text(f"Phase 2: captions {p2_pct}% ({st.session_state.p2_done}/{st.session_state.p2_total})")
@@ -695,8 +711,8 @@ with search_tab:
         elif uploaded:
             tmp = Image.open(uploaded).convert("RGB")
             vit_t = preprocess_vit(tmp).unsqueeze(0)
-            clip_t = (preprocess_clip(tmp).unsqueeze(0) if preprocess_clip is not None else None)
-            q_comb, _ = compute_batch_embeddings([vit_t.squeeze(0)], [clip_t.squeeze(0)] if clip_t is not None else [], vit_model, clip_model)
+            # Force ViT-only query to match index dimension
+            q_comb, _ = compute_batch_embeddings([vit_t.squeeze(0)], [], vit_model, None)
             q_emb = q_comb[0].astype(np.float32)
 
             if st.session_state.get("faiss_combined"):
@@ -1022,6 +1038,11 @@ else:
                 if combined_idx_path.exists():
                     st.session_state.faiss_combined = faiss.read_index(str(combined_idx_path))
                     st.success("Loaded combined index.")
+                    try:
+                        if getattr(st.session_state.faiss_combined, "ntotal", 0) > 0:
+                            st.session_state.phase1_ready = True
+                    except Exception:
+                        pass
                 else:
                      st.error("combined.index not found in directory.")
 
@@ -1035,6 +1056,19 @@ else:
                     # Keep the ordered list of paths for indexing
                     st.session_state.index_paths = [item['path'] for item in manifest_data]
                     st.success(f"Loaded manifest for {len(st.session_state.index_paths)} images.")
+                    # Heuristic: mark captions ready if any cached caption exists
+                    try:
+                        has_caption = False
+                        for pth in st.session_state.index_paths[:100]:  # sample first 100
+                            cached = load_cache(fingerprint(Path(pth))) or {}
+                            cap = (cached.get("metadata", {}) or {}).get("caption")
+                            if cap:
+                                has_caption = True
+                                break
+                        if has_caption:
+                            st.session_state.phase2_ready = True
+                    except Exception:
+                        pass
                 else:
                     st.error("manifest.json not found in directory.")
 
@@ -1075,108 +1109,55 @@ else:
             st.error(f"Failed to load index files: {e}")
 
 
-st.header("Backend Monitoring")
-if st.button("Refresh Queue Stats", key="refresh_q_bottom"):
+# --- Case management (delete, refresh) ---
+with st.sidebar.expander("Manage Cases", expanded=False):
     try:
-        r = redis.Redis(host=st.session_state.redis_host, port=st.session_state.redis_port, db=0)
-        jobs_in_queue = r.llen("forceps:job_queue")
-        results_in_queue = r.llen("forceps:results_queue")
+        p = Path(st.session_state.cases_dir)
+        all_cases = sorted([d.name for d in p.iterdir() if d.is_dir()], reverse=True) if p.is_dir() else []
+    except Exception:
+        all_cases = []
 
-        c1, c2 = st.columns(2)
-        with c1:
-            st.metric("Jobs in Queue", f"{jobs_in_queue:,}")
-        with c2:
-            st.metric("Results in Queue", f"{results_in_queue:,}")
+    if not all_cases:
+        st.caption("No cases to manage.")
+    else:
+        to_delete = st.multiselect("Select case(s) to delete", all_cases, key="cases_to_delete")
+        confirm_del = st.checkbox("I understand this permanently deletes selected case folders.")
+        if st.button("Delete Selected Cases"):
+            if not to_delete:
+                st.warning("No cases selected.")
+            elif not confirm_del:
+                st.warning("Please confirm deletion.")
+            else:
+                deleted = []
+                errors = []
+                for name in to_delete:
+                    case_dir = Path(st.session_state.cases_dir) / name
+                    try:
+                        if case_dir.is_dir():
+                            shutil.rmtree(case_dir)
+                            deleted.append(name)
+                            # If we deleted currently loaded case, clear session indices
+                            if st.session_state.get("selected_case") == name:
+                                st.session_state.faiss_combined = None
+                                st.session_state.faiss_clip = None
+                                st.session_state.index_paths = []
+                                st.session_state.manifest = {}
+                                st.session_state.embeddings = None
+                                st.session_state.phase1_ready = False
+                                st.session_state.phase2_ready = False
+                        else:
+                            errors.append(f"Not a directory: {case_dir}")
+                    except Exception as e:
+                        errors.append(f"{name}: {e}")
+                if deleted:
+                    st.success(f"Deleted: {', '.join(deleted)}")
+                for msg in errors:
+                    st.error(msg)
+                # Refresh page to reflect updated case list
+                st.rerun()
 
-    except Exception as e:
-        st.error(f"Could not connect to Redis: {e}")
 
-# Search UI
-st.header("Search")
-col1, col2 = st.columns([3,1])
-with col1:
-    nl_query = st.text_input("Natural language query (optional)", key="nl_query_bottom")
-    tag_query = st.text_input("Filter by tag (optional)", help="Show only images whose tags include this exact term", key="tag_query_bottom")
-    uploaded = st.file_uploader("Or upload an image for search", type=["jpg","png","jpeg","bmp","gif"], key="uploader_bottom")
-    run_search = st.button("Run Search", key="run_search_bottom")
-with col2:
-    st.markdown("**Index readiness**")
-    st.write(f"- Phase 1 (embeddings): {'✅' if st.session_state.phase1_ready else '❌'}")
-    st.write(f"- Phase 2 (captions): {'✅' if st.session_state.phase2_ready else '❌'}")
-    st.write(f"- Ollama: {'available' if ollama_installed() else 'not available'}")
-    if st.session_state.indexing_running:
-        p1_pct = int((st.session_state.p1_done / st.session_state.p1_total) * 100) if st.session_state.p1_total else 0
-        p2_pct = int((st.session_state.p2_done / st.session_state.p2_total) * 100) if st.session_state.p2_total else 0
-        progress1.progress(p1_pct)
-        progress2.progress(p2_pct)
-        phase1_placeholder.text(f"Phase 1: embeddings {p1_pct}% ({st.session_state.p1_done}/{st.session_state.p1_total})")
-        phase2_placeholder.text(f"Phase 2: captions {p2_pct}% ({st.session_state.p2_done}/{st.session_state.p2_total})")
-    if st.session_state.index_error:
-        st.error(st.session_state.index_error)
-    # Stats after indexing
-    if st.session_state.faiss_combined is not None:
-        s = _index_stats(st.session_state.faiss_combined)
-        st.caption(f"Combined index: ntotal={s.get('ntotal',0)}, nlist={s.get('nlist','-')}, pq_m={s.get('pq_m','-')}")
-    if st.session_state.faiss_clip is not None:
-        s = _index_stats(st.session_state.faiss_clip)
-        st.caption(f"CLIP index: ntotal={s.get('ntotal',0)}, nlist={s.get('nlist','-')}, pq_m={s.get('pq_m','-')}")
-    # Timing
-    if st.session_state.phase1_duration is not None:
-        st.caption(f"Phase 1 duration: {st.session_state.phase1_duration:.1f}s")
-    if st.session_state.phase2_duration is not None:
-        st.caption(f"Phase 2 duration: {st.session_state.phase2_duration:.1f}s")
-    if st.session_state.total_index_duration is not None:
-        st.caption(f"Total duration: {st.session_state.total_index_duration:.1f}s")
-
-results = st.session_state.get("last_results", [])
-if run_search:
-    results = []
-    vector_results = set()
-    keyword_results = set()
-
-    # 1. Vector Search (FAISS)
-    if nl_query and st.session_state.get("faiss_clip"):
-        q_emb = compute_clip_text_embedding(nl_query, clip_model)
-        _, I = st.session_state.faiss_clip.search(np.array([q_emb], dtype=np.float32), 100)
-        vector_results.update([st.session_state.index_paths[i] for i in I[0] if i != -1])
-    elif uploaded:
-        tmp = Image.open(uploaded).convert("RGB")
-        vit_t = preprocess_vit(tmp).unsqueeze(0)
-        clip_t = (preprocess_clip(tmp).unsqueeze(0) if preprocess_clip is not None else None)
-        q_comb, _ = compute_batch_embeddings([vit_t.squeeze(0)], [clip_t.squeeze(0)] if clip_t is not None else [], vit_model, clip_model)
-        q_emb = q_comb[0].astype(np.float32)
-
-        if st.session_state.get("faiss_combined"):
-            idx_to_use = st.session_state.faiss_combined
-            if st.session_state.get("pca_obj"):
-                q_emb = st.session_state.pca_obj.apply_py(np.array([q_emb]))[0]
-
-            _, I = idx_to_use.search(np.array([q_emb], dtype=np.float32), 100)
-            vector_results.update([st.session_state.index_paths[i] for i in I[0] if i != -1])
-
-    # 2. Keyword Search (Whoosh)
-    if nl_query and st.session_state.get("whoosh_searcher"):
-        searcher = st.session_state.whoosh_searcher
-        parser = QueryParser("content", schema=searcher.schema)
-        query = parser.parse(nl_query)
-        keyword_hits = searcher.search(query, limit=200)
-        keyword_results.update([hit['path'] for hit in keyword_hits])
-
-    # 3. Combine and Re-rank Results
-    # Simple re-ranking: boost items that appear in both result sets.
-    final_results = []
-    intersection = vector_results.intersection(keyword_results)
-
-    # Add boosted intersection results first
-    final_results.extend(list(intersection))
-
-    # Add remaining vector results
-    final_results.extend([p for p in vector_results if p not in intersection])
-
-    # Add remaining keyword results
-    final_results.extend([p for p in keyword_results if p not in intersection])
-
-    st.session_state.last_results = final_results
+## Duplicate Backend Monitoring and Search UI removed (content provided in the main Search & Results tab)
 
 # Apply EXIF filters to current results for display
 def _exif_for_path(path_str: str):

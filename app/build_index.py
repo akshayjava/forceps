@@ -199,5 +199,14 @@ def main():
 
     logger.info(f"--- Index building complete for case '{cfg_case['case_name']}' ---")
 
+    # Optionally clear the queues now that we've built the index
+    try:
+        logger.info(f"Clearing results queue '{cfg_redis['results_queue']}'...")
+        r.delete(cfg_redis['results_queue'])
+        logger.info(f"Clearing job queue '{cfg_redis['job_queue']}'...")
+        r.delete(cfg_redis['job_queue'])
+    except Exception as e:
+        logger.warning(f"Failed to clear queues: {e}")
+
 if __name__ == "__main__":
     main()

@@ -56,6 +56,8 @@ def main():
     parser = argparse.ArgumentParser(description="FORCEPS Job Enqueuer")
     parser.add_argument("--config", type=str, default="app/config.yaml", help="Path to the configuration file.")
     parser.add_argument("--mode", type=str, default="full", choices=["full", "triage"], help="Indexing mode.")
+    parser.add_argument("--input_dir", type=str, default=None, help="Override input_dir from config")
+    parser.add_argument("--job_batch_size", type=int, default=None, help="Override batch size for jobs enqueued")
     args = parser.parse_args()
 
     try:
@@ -70,7 +72,12 @@ def main():
 
     cfg_redis = config['redis']
     cfg_data = config['data']
+    # Optional override from CLI
+    if args.input_dir:
+        cfg_data['input_dir'] = args.input_dir
     cfg_perf = config['performance']['enqueuer']
+    if args.job_batch_size:
+        cfg_perf['job_batch_size'] = max(1, int(args.job_batch_size))
 
     logger.info(f"--- FORCEPS Job Enqueuer (Mode: {args.mode}) ---")
 
@@ -99,6 +106,14 @@ def main():
     logger.info(f"Found and processed {len(image_data)} total images.")
 
     # 4. Enqueue jobs in batches
+    # Initialize progress stats in Redis
+    try:
+        r.set("forceps:stats:total_images", len(image_data))
+        r.set("forceps:stats:embeddings_done", 0)
+        r.set("forceps:stats:captions_done", 0)
+    except Exception:
+        pass
+
     jobs_enqueued = 0
     for i in range(0, len(image_data), cfg_perf['job_batch_size']):
         batch = image_data[i:i + cfg_perf['job_batch_size']]

@@ -1,0 +1,39 @@
+case_details:
+  case_name: "local-case"
+  case_description: "Run via local enqueuer/worker"
+
+redis:
+  host: "127.0.0.1"
+  port: 6379
+  job_queue: "forceps:job_queue"
+  results_queue: "forceps:results_queue"
+
+data:
+  input_dir: "/Users/Shared/Projects/2017"
+  output_dir: "/Users/Shared/Projects/foreceps/output_index"
+
+models:
+  onnx_dir: "/Users/Shared/Projects/foreceps/models/onnx"
+
+performance:
+  worker:
+    batch_size: 16
+    max_workers: 4
+  enqueuer:
+    job_batch_size: 256
+    scan_max_workers: 8
+  faiss:
+    use_pca: false
+    pca_dim: 384
+    ivf_nlist: 4096
+    pq_m: 64
+    train_samples: 5000
+    add_batch: 8192
+
+hashing:
+  - "sha256"
+  - "perceptual"
+
+features:
+  enable_captions: false
+
