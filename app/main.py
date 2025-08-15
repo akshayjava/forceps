@@ -355,6 +355,32 @@ log_placeholder = st.sidebar.empty()
 progress1 = st.sidebar.progress(0)
 progress2 = st.sidebar.progress(0)
 
+# Live progress from Redis (updates every render)
+try:
+    # Optional lightweight auto-refresh for the sidebar
+    try:
+        st.autorefresh(interval=3000, key="progress_autorefresh")
+    except Exception:
+        pass
+    import redis as _r
+    rc = _r.Redis(host=st.session_state.redis_host, port=st.session_state.redis_port, db=0)
+    total = int(rc.get("forceps:stats:total_images") or 0)
+    done1 = int(rc.get("forceps:stats:embeddings_done") or 0)
+    done2 = int(rc.get("forceps:stats:captions_done") or 0)
+    p1_pct = min(100, int(done1 * 100 / total)) if total > 0 else 0
+    p2_pct = min(100, int(done2 * 100 / total)) if total > 0 else 0
+    progress1.progress(p1_pct)
+    progress2.progress(p2_pct)
+    phase1_placeholder.text(f"Phase 1: embeddings {p1_pct}% ({done1}/{total})")
+    phase2_placeholder.text(f"Phase 2: captions {p2_pct}% ({done2}/{total})")
+    if total > 0 and done1 >= total:
+        st.session_state.phase1_ready = True
+    if total > 0 and done2 >= total:
+        st.session_state.phase2_ready = True
+except Exception:
+    # Ignore if Redis not available
+    pass
+
 # Bookmarks / Export section
 st.sidebar.markdown("---")
 st.sidebar.subheader("Bookmarks / Reports")
