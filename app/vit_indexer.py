@@ -91,7 +91,9 @@ class ViTIndexer:
     
     def __init__(self, model_name: str = "google/vit-base-patch16-224-in21k", 
                  device: str = "auto", batch_size: int = 32, use_fp16: bool = True,
-                 compile_model: bool = True, use_channels_last: bool = True):
+                 compile_model: bool = True, use_channels_last: bool = True,
+                 enable_coreml: bool = False, use_v2_transforms: bool = False,
+                 use_webdataset: bool = False, webdataset_pattern: str = ""):
         """
         Initialize the ViT indexer
         
@@ -106,6 +108,10 @@ class ViTIndexer:
         self.batch_size = batch_size
         self.use_fp16 = use_fp16 and device != "cpu"
         self.device = self._setup_device(device)
+        self.enable_coreml = enable_coreml and platform.system() == 'Darwin'
+        self.use_v2_transforms = use_v2_transforms
+        self.use_webdataset = use_webdataset
+        self.webdataset_pattern = webdataset_pattern
         
         # Load ViT model and processor
         logger.info(f"Loading ViT model: {model_name}")
@@ -120,7 +126,7 @@ class ViTIndexer:
             logger.info("Using channels_last memory format")
         
         # Optimization: compile model for PyTorch 2.0+
-        if compile_model and hasattr(torch, 'compile'):
+        if compile_model and self.device.type == 'cuda' and hasattr(torch, 'compile'):
             try:
                 self.model = torch.compile(self.model, mode='max-autotune')
                 logger.info("Model compiled with torch.compile")
@@ -133,6 +139,22 @@ class ViTIndexer:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             logger.info("Enabled CUDA optimizations (TF32, cuDNN benchmark)")
+        else:
+            logger.info("CUDA not available; compile/TF32 disabled")
+
+        # Optional CoreML path (scaffold)
+        self.coreml_model = None
+        if self.enable_coreml:
+            try:
+                import coremltools as ct  # type: ignore
+                example = torch.randn(1,3,224,224)
+                traced = torch.jit.trace(self.model, example)
+                self.coreml_model = ct.convert(
+                    traced, inputs=[ct.TensorType(name="input", shape=example.shape)]
+                )
+                logger.info("CoreML model converted (experimental)")
+            except Exception as e:
+                logger.warning(f"CoreML conversion unavailable: {e}")
         
         # Get embedding dimension
         with torch.no_grad():
@@ -417,7 +439,8 @@ class OptimizedImageDataset(Dataset):
     def __init__(self, image_paths: List[str], processor: ViTImageProcessor, 
                  use_fp16: bool = False, use_channels_last: bool = False,
                  target_size: Tuple[int, int] = (224, 224), 
-                 use_opencv: bool = True, cache_size: int = 1000):
+                 use_opencv: bool = True, cache_size: int = 1000,
+                 use_v2_transforms: bool = False):
         self.image_paths = image_paths
         self.processor = processor
         self.use_fp16 = use_fp16
@@ -425,13 +448,25 @@ class OptimizedImageDataset(Dataset):
         self.target_size = target_size
         self.use_opencv = use_opencv
         
-        # Pre-compute normalization values to avoid repeated calculations
-        self.mean = torch.tensor(processor.image_mean).view(3, 1, 1)
-        self.std = torch.tensor(processor.image_std).view(3, 1, 1)
-        
-        if use_fp16:
-            self.mean = self.mean.half()
-            self.std = self.std.half()
+        # Pre-compute normalization values or v2 transforms
+        self.use_v2 = use_v2_transforms
+        if not self.use_v2:
+            self.mean = torch.tensor(processor.image_mean).view(3, 1, 1)
+            self.std = torch.tensor(processor.image_std).view(3, 1, 1)
+            if use_fp16:
+                self.mean = self.mean.half()
+                self.std = self.std.half()
+        else:
+            try:
+                from torchvision.transforms import v2 as T2  # type: ignore
+                self.t2 = T2.Compose([
+                    T2.Resize(self.target_size),
+                    T2.ToImage(),
+                    T2.ToDtype(torch.float32, scale=True),
+                    T2.Normalize(mean=processor.image_mean, std=processor.image_std),
+                ])
+            except Exception:
+                self.use_v2 = False
         
         # Image cache for frequently accessed images
         self.cache = {}
@@ -465,9 +500,14 @@ class OptimizedImageDataset(Dataset):
                 image = Image.open(image_path).convert('RGB')
                 img_array = np.array(image.resize(self.target_size, Image.LANCZOS))
             
-            # Convert to tensor and normalize manually (faster than processor)
-            tensor = torch.from_numpy(img_array).permute(2, 0, 1).float() / 255.0
-            tensor = (tensor - self.mean) / self.std
+            if self.use_v2:
+                from PIL import Image as _PIL
+                pil = _PIL.fromarray(img_array)
+                tensor = self.t2(pil)
+            else:
+                # Convert to tensor and normalize manually (faster than processor)
+                tensor = torch.from_numpy(img_array).permute(2, 0, 1).float() / 255.0
+                tensor = (tensor - self.mean) / self.std
             
             if self.use_fp16:
                 tensor = tensor.half()
@@ -651,11 +691,12 @@ class MultiGPUViTIndexer:
     def extract_features_streaming(self, image_paths: List[str]) -> Generator[Tuple[np.ndarray, List[str]], None, None]:
         """Streaming feature extraction to reduce memory usage"""
         dataset = OptimizedImageDataset(
-            image_paths, self.processor, 
-            use_fp16=self.use_fp16, 
+            image_paths, self.processor,
+            use_fp16=self.use_fp16,
             use_channels_last=True,
             use_opencv=True,
-            cache_size=min(1000, len(image_paths) // 10)
+            cache_size=min(1000, len(image_paths) // 10),
+            use_v2_transforms=self.use_v2_transforms
         )
         
         # Optimized DataLoader settings (safe on non-CUDA)
