@@ -48,16 +48,18 @@ The system is composed of several key components that work together:
 4.  **Index Builder (`build_index.py`):** A script that consumes results, aggregates all embeddings, and builds the final search indexes (FAISS for vectors, Whoosh for text).
 5.  **User Interface (`main.py`):** A Streamlit application for controlling the backend and analyzing results.
 
-## Running with Docker Compose (Recommended)
+## Installation & Setup
+
+### Option 1: Running with Docker Compose (Recommended for Production)
 The easiest way to run the entire FORCEPS stack is with `docker-compose`.
 
-### 1. Prerequisites
+#### 1. Prerequisites
 - **Install Docker and Docker Compose.**
 - **NVIDIA GPU Users:** Ensure you have the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) installed.
 - **Prepare your data:** Create host directories for your images (e.g., `./images`) and for the output (e.g., `./output_index`). The `docker-compose.yml` file maps these to the correct paths inside the containers.
 - **(Optional) Convert models to ONNX:** For maximum performance, run `python app/convert_models.py --output_dir models/onnx`.
 
-### 2. Launch the Application
+#### 2. Launch the Application
 From the root of the project directory, run:
 ```bash
 docker-compose up --build
@@ -67,22 +69,164 @@ To run multiple workers for faster processing, use the `--scale` flag:
 docker-compose up --build --scale worker=4
 ```
 
+### Option 2: Command Line Setup (for Development/Testing)
+
+#### 1. Prerequisites
+- **Python 3.9+**
+- **Redis Server** installed and running
+- **Git** for version control
+- **Required libraries** (see requirements.txt)
+
+#### 2. Clone the Repository
+```bash
+git clone https://github.com/akshayjava/forceps.git
+cd foreceps
+```
+
+#### 3. Create a Virtual Environment
+```bash
+python -m venv venv_forceps
+source venv_forceps/bin/activate  # On Windows: venv_forceps\Scripts\activate
+```
+
+#### 4. Install Dependencies
+```bash
+pip install -r requirements.txt
+```
+
+#### 5. Setup Redis
+Ensure Redis is running on localhost:6379 (default):
+```bash
+# On macOS with Homebrew
+brew install redis
+brew services start redis
+
+# On Ubuntu/Debian
+sudo apt install redis-server
+sudo systemctl start redis-server
+
+# Verify Redis is running
+redis-cli ping  # Should return PONG
+```
+
+## Running FORCEPS from the Command Line
+
+### 1. Configure Your Case
+Edit the configuration file to specify your input directory and other settings:
+
+```bash
+# Standard configuration
+vim app/config.yaml
+
+# Or use the optimized configuration for better performance
+vim app/config_optimized.yaml
+```
+
+Key settings to update:
+- `data.input_dir`: Path to your forensic images directory
+- `data.output_dir`: Where to store the output (default: `./output_index`)
+- `case_details.case_name`: Name for your investigation case
+
+### 2. Start the Web Application (UI)
+
+The Streamlit web interface provides control over the entire system:
+
+```bash
+# Ensure PYTHONPATH includes the project root
+PYTHONPATH=/path/to/foreceps streamlit run app/main.py --server.port 8501 --server.address localhost
+```
+
+This will launch the web application at http://localhost:8501
+
+### 3. Start Background Processing Workers
+
+For optimal performance, start multiple worker processes to process images in parallel:
+
+```bash
+# Start multiple optimized workers (in separate terminals)
+PYTHONPATH=/path/to/foreceps python app/optimized_worker.py --config app/config_optimized.yaml
+PYTHONPATH=/path/to/foreceps python app/optimized_worker.py --config app/config_optimized.yaml
+PYTHONPATH=/path/to/foreceps python app/optimized_worker.py --config app/config_optimized.yaml
+
+# Optionally run the auto-scaling worker manager
+PYTHONPATH=/path/to/foreceps python app/auto_scale_workers.py --config app/config_optimized.yaml
+```
+
+### 4. Process a Directory of Images
+
+Queue a directory of images for processing with the enqueuer script:
+
+```bash
+# Process a specific directory
+PYTHONPATH=/path/to/foreceps python app/enqueue_jobs.py --config app/config_optimized.yaml --input_dir /path/to/evidence --job_batch_size 256
+
+# Use the directory specified in the config file
+PYTHONPATH=/path/to/foreceps python app/enqueue_jobs.py --config app/config_optimized.yaml
+```
+
+### 5. Monitor Processing Progress
+
+Check the current processing status:
+
+```bash
+# View queue statistics
+redis-cli mget "forceps:stats:total_images" "forceps:stats:embeddings_done" "forceps:stats:captions_done"
+
+# View remaining jobs in queue
+redis-cli llen forceps:job_queue
+```
+
+### 6. Test Search Functionality
+
+Verify the system is working correctly with the test script:
+
+```bash
+python test_search.py
+```
+
+### 7. Running the Complete Pipeline
+
+Here's a complete sequence to run FORCEPS from scratch:
+
+```bash
+# Terminal 1: Start Redis (if not already running)
+redis-server
+
+# Terminal 2: Start the web interface
+PYTHONPATH=/path/to/foreceps streamlit run app/main.py
+
+# Terminal 3: Start worker processes
+PYTHONPATH=/path/to/foreceps python app/optimized_worker.py --config app/config_optimized.yaml
+
+# Terminal 4: Enqueue images for processing
+PYTHONPATH=/path/to/foreceps python app/enqueue_jobs.py --config app/config_optimized.yaml --input_dir /path/to/evidence
+```
+
 ## Using the Application
 
 ### 1. Configure Your Case
 Before starting, edit `app/config.yaml` (or `app/config.docker.yaml` if using Docker) to set your `case_name` and `input_dir`.
 
 ### 2. Start the Backend
-If running manually, start the `worker` and `indexer` scripts in separate terminals. If using Docker, `docker-compose up` handles this for you.
+If running manually, start the `worker` and `indexer` scripts in separate terminals as shown in the command line instructions above. If using Docker, `docker-compose up` handles this for you.
 
 ### 3. Start the Indexing Job
-Run the `enqueuer` script manually, or click the "Start Indexing Job" button in the UI. This will begin populating the Redis queue. You can monitor the progress in the UI's "Backend Monitoring" section.
+Run the `enqueuer` script manually as shown above, or click the "Start Indexing Job" button in the UI. This will begin populating the Redis queue. You can monitor the progress in the UI's "Backend Monitoring" section.
 
 ### 4. Analyze the Results
-Once the `indexer` script finishes, go to the UI (`http://localhost:8501`):
+Once processing is underway, you can immediately start using the UI (`http://localhost:8501`):
 1.  **Load the Case:** In the sidebar, select your case from the dropdown and click "Load Selected Case".
 2.  **Search:** Use the search bar to perform a hybrid keyword and semantic search.
 3.  **Inspect:** Click "Show Details" on any image to see its full path, all computed hashes, and EXIF metadata.
 4.  **Cluster:** Use the "Cluster Analysis" section to group results visually and find patterns.
 5.  **Bookmark:** Use the "Manage Bookmark" expander to save items of interest, add tags, and write detailed notes.
 6.  **Report:** Go to the "Reporting" tab to review all bookmarked items and generate a comprehensive PDF report for your case file.
+
+## Performance Optimization Tips
+
+- **Use the optimized configuration**: The `app/config_optimized.yaml` file contains settings optimized for high-performance processing.
+- **Run multiple workers**: Start 4-8 worker processes for optimal performance on a typical workstation.
+- **Adjust batch sizes**: For machines with limited memory, decrease `batch_size` in the config. For powerful machines, increase it.
+- **Enable GPU acceleration**: Set `use_gpu: true` in the config file when running on a CUDA-capable GPU.
+- **Tune Redis**: For very large datasets, consider adjusting Redis configuration for higher memory limits.
+- **Disk I/O**: For best performance, place input images and output directory on fast SSDs.
