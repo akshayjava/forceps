@@ -287,3 +287,15 @@ def generate_bookmarks_pdf(bookmarks: Dict[str, Dict[str, Any]]) -> bytes:
 
     out = pdf.output(dest="S").encode("latin1")
     return out
+
+def hamming_distance(hex_str1: str, hex_str2: str) -> int:
+    """Calculate the Hamming distance between two hex strings."""
+    try:
+        # Convert hex strings to integers
+        h1 = int(hex_str1, 16)
+        h2 = int(hex_str2, 16)
+        # XOR the integers and count the number of set bits (1s)
+        return bin(h1 ^ h2).count('1')
+    except (ValueError, TypeError):
+        # Return a large distance if hashes are invalid or not strings
+        return 256 # Larger than any possible 64-bit hash distance

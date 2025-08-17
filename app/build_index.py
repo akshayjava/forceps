@@ -83,6 +83,7 @@ def main():
     parser = argparse.ArgumentParser(description="FORCEPS Index Builder")
     parser.add_argument("--config", type=str, default="app/config.yaml", help="Path to the configuration file.")
     parser.add_argument("--mode", type=str, default="full", choices=["full", "triage"], help="Indexing mode.")
+    parser.add_argument("--case_name", type=str, default=None, help="Override the case name from the config file.")
     args = parser.parse_args()
 
     try:
@@ -98,7 +99,11 @@ def main():
     cfg_redis = config['redis']
     cfg_data = config['data']
     cfg_faiss = config['performance']['faiss']
-    cfg_case = config.get('case_details', {'case_name': f'case_{int(time.time())}'})
+
+    # Use the case name from the command line if provided, otherwise fall back to the config or a default.
+    case_name_from_config = config.get('case_details', {}).get('case_name')
+    case_name = args.case_name or case_name_from_config or f'case_{int(time.time())}'
+    cfg_case = {'case_name': case_name}
 
     # Create a simple namespace object for the build_index_for_embeddings function
     faiss_args = argparse.Namespace(**cfg_faiss)
