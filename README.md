@@ -127,7 +127,22 @@ Key settings to update:
 - `data.output_dir`: Where to store the output (default: `./output_index`)
 - `case_details.case_name`: Name for your investigation case
 
-### 2. Start the Web Application (UI)
+### 2. Run CLI Indexing (no UI)
+
+Quickly index a directory from the command line using the ViT indexer:
+
+```bash
+cd /path/to/foreceps
+python3 -m pip install --user --upgrade torch torchvision transformers faiss-cpu pillow tqdm opencv-python
+PYTHONPATH=. python3 run_cli.py \
+  --image_dir /path/to/images \
+  --output_dir index_out_opt \
+  --device auto --batch_size 16
+```
+
+By default, FP16/compile are disabled on CPU/MPS for stability and enabled (FP16 only) on CUDA. Use `--fp16/--no-fp16` and `--compile/--no-compile` to override.
+
+### 3. Start the Web Application (UI)
 
 The Streamlit web interface provides control over the entire system:
 
@@ -138,7 +153,7 @@ PYTHONPATH=/path/to/foreceps streamlit run app/main.py --server.port 8501 --serv
 
 This will launch the web application at http://localhost:8501
 
-### 3. Start Background Processing Workers
+### 4. Start Background Processing Workers
 
 For optimal performance, start multiple worker processes to process images in parallel:
 
@@ -152,7 +167,7 @@ PYTHONPATH=/path/to/foreceps python app/optimized_worker.py --config app/config_
 PYTHONPATH=/path/to/foreceps python app/auto_scale_workers.py --config app/config_optimized.yaml
 ```
 
-### 4. Process a Directory of Images
+### 5. Process a Directory of Images
 
 Queue a directory of images for processing with the enqueuer script:
 
@@ -164,7 +179,7 @@ PYTHONPATH=/path/to/foreceps python app/enqueue_jobs.py --config app/config_opti
 PYTHONPATH=/path/to/foreceps python app/enqueue_jobs.py --config app/config_optimized.yaml
 ```
 
-### 5. Monitor Processing Progress
+### 6. Monitor Processing Progress
 
 Check the current processing status:
 
@@ -176,7 +191,7 @@ redis-cli mget "forceps:stats:total_images" "forceps:stats:embeddings_done" "for
 redis-cli llen forceps:job_queue
 ```
 
-### 6. Test Search Functionality
+### 7. Test Search Functionality
 
 Verify the system is working correctly with the test script:
 
@@ -184,7 +199,7 @@ Verify the system is working correctly with the test script:
 python test_search.py
 ```
 
-### 7. Running the Complete Pipeline
+### 8. Running the Complete Pipeline
 
 Here's a complete sequence to run FORCEPS from scratch:
 
