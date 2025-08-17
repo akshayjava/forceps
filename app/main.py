@@ -112,6 +112,176 @@ st.markdown(
 vit_model, clip_model, preprocess_vit, preprocess_clip, vit_dim, clip_dim = load_models()
 COMBINED_DIM = vit_dim + clip_dim
 
+# --- Minimal Mode (fast, in-memory, no Redis/queues) ---
+st.sidebar.markdown("### Minimal Mode")
+min_mode = st.sidebar.checkbox("Fast in-memory indexing (simplified)", key="min_mode")
+if min_mode:
+    folder_min = st.sidebar.text_input("Folder", value=st.session_state.get("folder_path", str(Path(__file__).parent / "demo_images")), key="min_folder")
+    # Speed controls
+    model_choice = st.sidebar.selectbox(
+        "Model",
+        [
+            "google/vit-tiny-patch16-224",
+            "google/vit-small-patch16-224",
+            "google/vit-base-patch16-224-in21k",
+        ],
+        index=0,
+        help="Smaller models are much faster (tiny > small > base).",
+        key="min_model",
+    )
+    batch_size_ctl = st.sidebar.number_input("Batch size", min_value=16, max_value=256, value=128, step=16, key="min_batch")
+    io_workers_ctl = st.sidebar.number_input("Loader threads", min_value=4, max_value=32, value=12, step=1, key="min_io_workers")
+    use_ivfpq = st.sidebar.checkbox("Train IVF-PQ after embeddings (faster search)", value=False, key="min_ivfpq")
+    nlist_ctl = st.sidebar.number_input("IVF nlist", min_value=64, max_value=65536, value=4096, step=64, key="min_nlist") if use_ivfpq else 0
+    pqm_ctl = st.sidebar.number_input("PQ M", min_value=4, max_value=128, value=64, step=4, key="min_pqm") if use_ivfpq else 0
+
+    # Pre-resize utility (to cache)
+    def _preresize_to_cache(src_dir: str, target: int = 224, workers: int = 12) -> str:
+        src = Path(src_dir)
+        if not src.is_dir():
+            return src_dir
+        cache_root = Path("./cache/resized")
+        cache_root.mkdir(parents=True, exist_ok=True)
+        key = str(src.resolve())
+        import hashlib
+        digest = hashlib.sha1(key.encode()).hexdigest()[:12]
+        dst = cache_root / f"{digest}_{target}"
+        if dst.exists():
+            return str(dst)
+        # build file list
+        exts = {".jpg",".jpeg",".png",".bmp",".tiff",".webp"}
+        files = []
+        for r,_,fs in os.walk(src):
+            for fn in fs:
+                if Path(fn).suffix.lower() in exts:
+                    files.append(Path(r)/fn)
+        dst.mkdir(parents=True, exist_ok=True)
+        p = st.sidebar.progress(0)
+        t = st.sidebar.empty()
+        done = 0
+        from concurrent.futures import ThreadPoolExecutor
+        def _resize_one(pth: Path):
+            rel = pth.relative_to(src)
+            out_path = dst / rel
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                im = Image.open(pth).convert("RGB")
+                if im.size != (target, target):
+                    im = im.resize((target, target), Image.LANCZOS)
+                im.save(out_path, quality=90)
+            except Exception:
+                try:
+                    Image.new("RGB", (target, target)).save(out_path, quality=90)
+                except Exception:
+                    pass
+            return 1
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for _ in ex.map(_resize_one, files):
+                done += 1
+                if done % 50 == 0 or done == len(files):
+                    pct = int(done*100/len(files)) if files else 100
+                    p.progress(pct)
+                    t.text(f"Pre-resize {pct}% ({done}/{len(files)})")
+        return str(dst)
+
+    if st.sidebar.button("Pre-resize to 224 and use cache", key="min_preresize") and folder_min:
+        folder_min = _preresize_to_cache(folder_min, 224, io_workers_ctl)
+        st.sidebar.success(f"Using cached resized folder: {folder_min}")
+
+    start_min = st.sidebar.button("Index Now", key="min_start")
+    pbar = st.sidebar.progress(0)
+    status = st.sidebar.empty()
+
+    if start_min and folder_min:
+        import faiss
+        imgs = []
+        exts = {".jpg",".jpeg",".png",".bmp",".tiff",".webp"}
+        for r,_,files in os.walk(folder_min):
+            for fn in files:
+                if Path(fn).suffix.lower() in exts:
+                    imgs.append(os.path.join(r, fn))
+
+        if not imgs:
+            st.warning("No images found.")
+        else:
+            batch = int(batch_size_ctl)
+            all_embs = []
+            total = len(imgs)
+            done = 0
+            from concurrent.futures import ThreadPoolExecutor
+            for i in range(0, total, batch):
+                batch_paths = imgs[i:i+batch]
+                # threaded load
+                tensors = [None]*len(batch_paths)
+                def _load(ix_p):
+                    ix, p = ix_p
+                    try:
+                        im = Image.open(p).convert("RGB")
+                    except Exception:
+                        im = Image.new("RGB", (224,224))
+                    tensors[ix] = preprocess_vit(im)
+                with ThreadPoolExecutor(max_workers=int(io_workers_ctl)) as ex:
+                    list(ex.map(_load, enumerate(batch_paths)))
+                # Load models per selected backbone
+                vm, cm, pv, pc, vd, cd = load_models(model_choice)
+                embs, _ = compute_batch_embeddings(tensors, [], vm, None)
+                # normalize for IP
+                embs = embs / (np.linalg.norm(embs, axis=1, keepdims=True) + 1e-10)
+                all_embs.append(embs.astype(np.float32))
+                done = min(total, i+batch)
+                pct = int(done*100/total)
+                pbar.progress(pct)
+                status.text(f"Embeddings {pct}% ({done}/{total})")
+
+            embs_mat = np.vstack(all_embs)
+            if use_ivfpq:
+                d = embs_mat.shape[1]
+                nlist = int(nlist_ctl)
+                pqm = int(pqm_ctl)
+                quant = faiss.IndexFlatIP(d)
+                ivfpq = faiss.IndexIVFPQ(quant, d, nlist, pqm, 8)
+                # train on a subset
+                train_n = min(embs_mat.shape[0], max(4096, nlist*4))
+                ivfpq.train(embs_mat[:train_n])
+                ivfpq.add(embs_mat)
+                idx = ivfpq
+            else:
+                idx = faiss.IndexFlatIP(embs_mat.shape[1])
+                idx.add(embs_mat)
+
+            # store for session
+            st.session_state.min_index = idx
+            st.session_state.min_paths = imgs
+            st.success(f"Indexed {len(imgs)} images (in memory). You can search below.")
+
+    st.markdown("---")
+    st.subheader("Search (Minimal Mode)")
+    upl = st.file_uploader("Upload an image to search", type=["jpg","jpeg","png","bmp","gif"], key="min_upl")
+    if upl and st.session_state.get("min_index") is not None:
+        tmp_im = Image.open(upl).convert("RGB")
+        # Use same backbone as indexing
+        vm, cm, pv, pc, vd, cd = load_models(model_choice)
+        q = pv(tmp_im)
+        q_emb, _ = compute_batch_embeddings([q], [], vm, None)
+        qv = q_emb[0].astype(np.float32)
+        qv = qv / (np.linalg.norm(qv) + 1e-10)
+        D, I = st.session_state.min_index.search(np.array([qv], dtype=np.float32), 30)
+        cols = st.columns(5)
+        for i, idx_i in enumerate(I[0][:25]):
+            if idx_i < 0: continue
+            p = st.session_state.min_paths[idx_i]
+            try:
+                with open(p, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode("utf-8")
+                mime = mimetypes.guess_type(p)[0] or "image/jpeg"
+                cols[i%5].markdown(f"<div class='img-card'><img src='data:{mime};base64,{b64}' /></div>", unsafe_allow_html=True)
+                cols[i%5].caption(Path(p).name)
+            except Exception:
+                cols[i%5].write(Path(p).name)
+
+    # Stop rendering the rest of the complex UI in minimal mode
+    st.stop()
+
 # Session state init
 if "phase1_ready" not in st.session_state:
     st.session_state.phase1_ready = False
@@ -342,7 +512,8 @@ folder = st.session_state.folder_path
 start_btn = st.sidebar.button("Start Two-Phase Indexing")
 stop_btn = st.sidebar.button("Cancel Background Tasks")
 save_idx_btn = st.sidebar.button("Save indices to disk")
-concurrent_phase2 = st.sidebar.checkbox("Run Phase 2 concurrently", value=False, help="Start captions in parallel with embeddings (may compete for CPU)")
+concurrent_phase2 = False
+local_run_phase2 = st.sidebar.checkbox("Run captions after embeddings", value=False, key="local_fast_phase2")
 
 if ollama_installed():
     st.sidebar.success("Ollama: available")
@@ -602,28 +773,120 @@ def _index_stats(idx):
         pass
     return stats
 
-# Start two-phase indexing (reverted to stable behavior)
+def _local_index_fast(image_dir: str, case_name: str, run_phase2: bool = False, batch_size: int = max(32, BATCH_SIZE)):
+    import faiss
+    from app.embeddings import load_models, compute_batch_embeddings
+    from concurrent.futures import ThreadPoolExecutor
+
+    start_ts = time.time()
+    img_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'}
+    paths = []
+    for r, _, files in os.walk(image_dir):
+        for fn in files:
+            if Path(fn).suffix.lower() in img_exts:
+                paths.append(os.path.join(r, fn))
+
+    st.session_state.p1_total = len(paths)
+    st.session_state.p1_done = 0
+    phase1_placeholder.text("Phase 1: embeddings 0% (0/{})".format(len(paths)))
+    progress1.progress(0)
+
+    if not paths:
+        st.warning("No images found.")
+        return
+
+    vit_model, clip_model, preprocess_vit, preprocess_clip, vit_dim, clip_dim = load_models()
+
+    all_embs = []
+    # batching
+    for i in range(0, len(paths), batch_size):
+        batch_paths = paths[i:i+batch_size]
+        # Threaded image loading to overlap I/O
+        vit_list = [None] * len(batch_paths)
+        def _load_into(idx_p):
+            idx, pth = idx_p
+            try:
+                im = Image.open(pth).convert('RGB')
+            except Exception:
+                im = Image.new('RGB', (224, 224))
+            vit_list[idx] = preprocess_vit(im)
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(_load_into, enumerate(batch_paths)))
+
+        comb_np, _ = compute_batch_embeddings(vit_list, [], vit_model, None)
+        # L2-normalize for cosine IP
+        comb_np = comb_np / (np.linalg.norm(comb_np, axis=1, keepdims=True) + 1e-10)
+        all_embs.append(comb_np.astype(np.float32))
+
+        st.session_state.p1_done = min(len(paths), (i+batch_size))
+        pct = int(st.session_state.p1_done * 100 / len(paths))
+        progress1.progress(pct)
+        phase1_placeholder.text(f"Phase 1: embeddings {pct}% ({st.session_state.p1_done}/{len(paths)})")
+
+    embs = np.vstack(all_embs)
+
+    # Build flat IP index
+    index = faiss.IndexFlatIP(embs.shape[1])
+    index.add(embs)
+
+    # Save case
+    out_dir = Path(st.session_state.cases_dir) / case_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    faiss.write_index(index, str(out_dir / "combined.index"))
+    manifest = [{"path": p, "hashes": {}} for p in paths]
+    with open(out_dir / "manifest.json", 'w') as f:
+        json.dump(manifest, f, indent=2)
+
+    # Make the freshly built index immediately searchable in-session
+    st.session_state.faiss_combined = index
+    st.session_state.index_paths = paths
+    st.session_state.manifest = {item["path"]: item for item in manifest}
+    st.session_state.pca_obj = None
+
+    st.session_state.phase1_ready = True
+    st.session_state.selected_case = case_name
+    st.success(f"Embeddings complete. Saved to {out_dir}")
+
+    # Optional local captions
+    if run_phase2:
+        if not ollama_installed() or not model_available("llava"):
+            st.warning("Ollama or 'llava' model not available. Skipping Phase 2 captions.")
+        else:
+            st.session_state.p2_total = len(paths)
+            st.session_state.p2_done = 0
+            phase2_placeholder.text("Phase 2: captions 0% (0/{})".format(len(paths)))
+            progress2.progress(0)
+
+            def _cap_one(pth: str):
+                try:
+                    fp = fingerprint(Path(pth))
+                    cached = load_cache(fp) or {}
+                    cap = generate_caption_ollama(pth)
+                    if cap:
+                        cached["metadata"] = cached.get("metadata", {})
+                        cached["metadata"]["caption"] = cap
+                        save_cache(fp, cached)
+                except Exception:
+                    pass
+
+            import concurrent.futures as cf
+            with cf.ThreadPoolExecutor(max_workers=4) as ex:
+                futures = [ex.submit(_cap_one, p) for p in paths]
+                for _ in cf.as_completed(futures):
+                    st.session_state.p2_done += 1
+                    pct2 = int(st.session_state.p2_done * 100 / st.session_state.p2_total)
+                    progress2.progress(pct2)
+                    phase2_placeholder.text(f"Phase 2: captions {pct2}% ({st.session_state.p2_done}/{st.session_state.p2_total})")
+
+            st.session_state.phase2_ready = True
+            st.success("Captions complete.")
+
+    st.session_state.total_index_duration = time.time() - start_ts
+
 if start_btn:
-    st.info("Starting background process to enqueue indexing jobs...")
-    st.info("Ensure your workers (`engine.py`) and index builder (`build_index.py`) are running.")
-
-    enqueue_script_path = Path(__file__).parent / "enqueue_jobs.py"
-    command = [
-        sys.executable,
-        str(enqueue_script_path),
-        "--input_dir",
-        folder
-    ]
-
-    try:
-        # Launch the enqueuer script as a background process
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        st.session_state['enqueuer_process'] = process.pid
-        st.success(f"Successfully launched job enqueuer (PID: {process.pid}).")
-        st.code(" ".join(command))
-        # We don't wait for it to finish. The UI can now monitor Redis.
-    except Exception as e:
-        st.error(f"Failed to launch enqueuer script: {e}")
+    case_name = f"local-{int(time.time())}"
+    _local_index_fast(folder, case_name, run_phase2=local_run_phase2, batch_size=BATCH_SIZE)
 
 if save_idx_btn:
     if st.session_state.faiss_combined is not None:
