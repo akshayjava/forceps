@@ -137,10 +137,18 @@ python3 -m pip install --user --upgrade torch torchvision transformers faiss-cpu
 PYTHONPATH=. python3 run_cli.py \
   --image_dir /path/to/images \
   --output_dir index_out_opt \
-  --device auto --batch_size 16
+  --device auto --batch_size 16 \
+  --captions  # optional; requires ollama + llava
 ```
 
 By default, FP16/compile are disabled on CPU/MPS for stability and enabled (FP16 only) on CUDA. Use `--fp16/--no-fp16` and `--compile/--no-compile` to override.
+
+Indexes written to `output_dir`:
+- `image_index.faiss`: FAISS vector index
+- `image_paths.pkl`: list of image paths
+- `metadata.pkl`: index metadata
+- `exif.json`: EXIF fields for filtering (make/model/datetime)
+- `captions.tsv` (optional): image path + tab + caption
 
 ### 3. Start the Web Application (UI)
 
@@ -152,6 +160,11 @@ PYTHONPATH=/path/to/foreceps streamlit run app/main.py --server.port 8501 --serv
 ```
 
 This will launch the web application at http://localhost:8501
+
+The UI supports:
+- Search by image (nearest neighbors from `image_index.faiss`)
+- Search by text (if CLIP text index is available; otherwise use captions.tsv via a simple grep-like interface)
+- Filtering by EXIF (uses `exif.json`)
 
 ### 4. Start Background Processing Workers
 
@@ -191,12 +204,36 @@ redis-cli mget "forceps:stats:total_images" "forceps:stats:embeddings_done" "for
 redis-cli llen forceps:job_queue
 ```
 
-### 7. Test Search Functionality
+### 7. Command-line Query Tools
 
-Verify the system is working correctly with the test script:
-
+Image query (top-10):
 ```bash
-python test_search.py
+python3 - <<'PY'
+import sys, pickle, numpy as np, torch
+from transformers import ViTImageProcessor, ViTModel
+from PIL import Image
+import faiss, os
+outdir = "index_out_opt"
+query_img = sys.argv[1]
+paths = pickle.load(open(os.path.join(outdir,"image_paths.pkl"),"rb"))
+index = faiss.read_index(os.path.join(outdir,"image_index.faiss"))
+proc = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224-in21k")
+model = ViTModel.from_pretrained("google/vit-base-patch16-224-in21k"); model.eval()
+im = Image.open(query_img).convert("RGB")
+inp = proc(images=im, return_tensors="pt")
+with torch.no_grad():
+    feat = model(**inp).last_hidden_state[:,0].cpu().float().numpy()
+feat /= (np.linalg.norm(feat,axis=1,keepdims=True)+1e-8)
+D,I = index.search(feat.astype("float32"), 10)
+for r,(d,idx) in enumerate(zip(D[0],I[0]),1):
+    if idx==-1: continue
+    print(f"{r:02d}\t{paths[idx]}")
+PY "/path/to/query.jpg"
+```
+
+Text query via caption file:
+```bash
+grep -i "your phrase here" index_out_opt/captions.tsv | cut -f1 | head -n 10
 ```
 
 ### 8. Running the Complete Pipeline

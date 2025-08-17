@@ -16,6 +16,12 @@ import sys
 import argparse
 from pathlib import Path
 import torch
+import json
+import subprocess
+from typing import Dict, Any
+
+# Lightweight EXIF helper
+from app.utils import read_exif
 
 def main():
     try:
@@ -36,6 +42,8 @@ def main():
     parser.add_argument("--device", choices=["auto","cpu","cuda","mps"], default="auto", help="Computation device")
     parser.add_argument("--batch_size", type=int, default=int(os.environ.get("FORCEPS_BATCH", 16)), help="Batch size")
     parser.add_argument("--max_images", type=int, default=None, help="Limit number of images (for testing)")
+    parser.add_argument("--captions", action="store_true", help="Generate captions with Ollama llava and save to captions.tsv")
+    parser.add_argument("--ollama_model", default="llava", help="Ollama model name for captions")
     parser.add_argument("--fp16", action="store_true", help="Enable FP16 (CUDA only)")
     parser.add_argument("--no-fp16", dest="fp16", action="store_false")
     parser.set_defaults(fp16=None)
@@ -84,6 +92,55 @@ def main():
         indexer.process_images(image_dir=image_dir, output_dir=output_dir,
                                max_images=args.max_images, chunk_size=10000)
     print("Done. FAISS index + metadata written to", output_dir)
+
+    # Save EXIF metadata (make/model/datetime) for filters
+    try:
+        paths = None
+        import pickle
+        with open(os.path.join(output_dir, "image_paths.pkl"), "rb") as f:
+            paths = pickle.load(f)
+        exif_map: Dict[str, Any] = {}
+        for p in paths:
+            try:
+                ex = read_exif(Path(p)) or {}
+                # serialize time as string
+                dt = ex.get("DateTime")
+                if dt is not None:
+                    import time as _t
+                    try:
+                        ex["DateTime"] = _t.strftime("%Y-%m-%d %H:%M:%S", dt)
+                    except Exception:
+                        ex["DateTime"] = str(dt)
+                exif_map[p] = ex
+            except Exception:
+                exif_map[p] = {}
+        with open(os.path.join(output_dir, "exif.json"), "w") as f:
+            json.dump(exif_map, f)
+        print("Saved exif.json")
+    except Exception as exc:
+        print("EXIF save skipped:", exc)
+
+    # Optional captions via Ollama
+    if args.captions:
+        try:
+            # Check model availability
+            out = subprocess.check_output(["ollama", "list"]) if shutil.which("ollama") else b""
+            if args.ollama_model.split(":")[0] in out.decode("utf-8", "ignore"):
+                print("Generating captions to captions.tsv using", args.ollama_model)
+                cap_path = os.path.join(output_dir, "captions.tsv")
+                with open(cap_path, "w") as outf:
+                    for i, p in enumerate(paths or []):
+                        prompt = f"Describe the image in detail (scene, objects, colors, notable items). Image: file://{p}"
+                        proc = subprocess.run(["ollama", "run", args.ollama_model], input=prompt.encode("utf-8"), capture_output=True)
+                        cap = proc.stdout.decode("utf-8", "ignore").strip().replace("\t", " ")
+                        outf.write(f"{p}\t{cap}\n")
+                        if (i+1) % 50 == 0:
+                            print(f"captions: {i+1}/{len(paths)}")
+                print("Saved captions.tsv")
+            else:
+                print("Ollama model not found; skipping captions")
+        except Exception as exc:
+            print("Captions skipped:", exc)
 
 if __name__ == "__main__":
     main()
