@@ -21,25 +21,37 @@ from app.embeddings import load_models, compute_batch_embeddings
 
 
 def load_case(case_dir: Path):
+	"""Load an index and manifest from either FORCEPS case or vit_indexer output."""
+	# FORCEPS case format
 	combined_idx_path = case_dir / "combined.index"
 	manifest_path = case_dir / "manifest.json"
 	pca_path = case_dir / "pca.matrix.pkl"
 
-	if not combined_idx_path.exists():
-		raise FileNotFoundError(f"FAISS index not found at {combined_idx_path}")
-	if not manifest_path.exists():
-		raise FileNotFoundError(f"manifest.json not found at {manifest_path}")
-
-	index = faiss.read_index(str(combined_idx_path))
-	with open(manifest_path, "r") as f:
-		manifest = json.load(f)
+	# vit_indexer format
+	vi_faiss = case_dir / "image_index.faiss"
+	vi_paths = case_dir / "image_paths.pkl"
 
 	pca = None
-	if pca_path.exists():
-		with open(pca_path, "rb") as f:
-			pca = pickle.load(f)
 
-	return index, manifest, pca
+	if combined_idx_path.exists() and manifest_path.exists():
+		index = faiss.read_index(str(combined_idx_path))
+		with open(manifest_path, "r") as f:
+			manifest = json.load(f)
+		if pca_path.exists():
+			with open(pca_path, "rb") as f:
+				pca = pickle.load(f)
+		return index, manifest, pca
+
+	if vi_faiss.exists() and vi_paths.exists():
+		index = faiss.read_index(str(vi_faiss))
+		with open(vi_paths, "rb") as f:
+			paths = pickle.load(f)
+		manifest = [{"path": p} for p in paths]
+		return index, manifest, None
+
+	raise FileNotFoundError(
+		f"No supported index found in {case_dir}. Expected (combined.index + manifest.json) or (image_index.faiss + image_paths.pkl)."
+	)
 
 
 def embed_image_vit_only(image_path: Path, vit_model, preprocess_vit):
