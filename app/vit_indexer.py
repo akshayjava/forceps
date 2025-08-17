@@ -33,6 +33,16 @@ try:
 except RuntimeError:
     pass
 
+# Byte size helper
+def _fmt_gb_tb(total_bytes: int) -> str:
+    try:
+        gb = total_bytes / float(1024 ** 3)
+        if gb >= 1024.0:
+            return f"{gb/1024.0:.2f} TB"
+        return f"{gb:.2f} GB"
+    except Exception:
+        return "0 GB"
+
 class ImageDataset(Dataset):
     """Custom dataset for loading images from directory with optimizations"""
     
@@ -282,6 +292,13 @@ class ViTIndexer:
         if max_images:
             image_paths = image_paths[:max_images]
         discovery_time = time.time() - discovery_start
+        # Total bytes processed
+        total_bytes = 0
+        for p in image_paths:
+            try:
+                total_bytes += os.path.getsize(p)
+            except Exception:
+                pass
         
         total_images = len(image_paths)
         logger.info(f"Processing {total_images} images in chunks of {chunk_size}")
@@ -754,7 +771,7 @@ class MultiGPUViTIndexer:
         
         total_images = len(image_paths)
         logger.info(f"Processing {total_images} images")
-        logger.info(f"File discovery: {discovery_time:.2f}s")
+        logger.info(f"File discovery: {discovery_time:.2f}s; size: {_fmt_gb_tb(total_bytes)}")
         
         # Streaming feature extraction
         extraction_start = time.time()
@@ -814,6 +831,7 @@ class MultiGPUViTIndexer:
         logger.info(f"Saving:           {save_time:8.2f}s")
         logger.info(f"Total:            {total_time:8.2f}s")
         logger.info(f"Rate:             {total_images/total_time:8.1f} imgs/sec")
+        logger.info(f"Data:             {_fmt_gb_tb(total_bytes)} processed")
         logger.info("="*60)
     
     def save_index(self, index: faiss.Index, image_paths: List[str], output_dir: str):
