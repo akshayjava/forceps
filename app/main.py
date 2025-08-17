@@ -55,10 +55,6 @@ from app.utils import (
     save_cache,
     compute_perceptual_hashes,
     read_exif,
-    load_bookmarks,
-    save_bookmarks,
-    generate_bookmarks_csv,
-    generate_bookmarks_pdf,
     _gather_metadata_for_path,
     hamming_distance,
 )
@@ -304,8 +300,7 @@ if "faiss_partial" not in st.session_state:
     st.session_state.faiss_partial = None  # IndexIDMap2 over IndexFlatL2 for combined embeddings
 if "faiss_clip_partial" not in st.session_state:
     st.session_state.faiss_clip_partial = None  # IndexIDMap2 for CLIP embeddings during indexing
-if "bookmarks" not in st.session_state:
-    st.session_state.bookmarks = {}
+//
 if "last_results" not in st.session_state:
     # Persist last shown results across UI interactions (e.g., bookmarking)
     st.session_state.last_results = []
@@ -480,19 +475,7 @@ try:
         info_state_key = f"info_state_{path_clicked}"
         st.session_state[info_state_key] = False
         _clear_query_param_compat("close_info")
-    if "add_bm" in qp_now:
-        val = qp_now["add_bm"]
-        path_clicked = urllib.parse.unquote(val if isinstance(val, str) else str(val[0]))
-        st.session_state.bookmarks[path_clicked] = st.session_state.bookmarks.get(path_clicked, {"tags": [], "added_ts": time.time()})
-        save_bookmarks(st.session_state.bookmarks)
-        _clear_query_param_compat("add_bm")
-    if "remove_bm" in qp_now:
-        val = qp_now["remove_bm"]
-        path_clicked = urllib.parse.unquote(val if isinstance(val, str) else str(val[0]))
-        if path_clicked in st.session_state.bookmarks:
-            st.session_state.bookmarks.pop(path_clicked, None)
-            save_bookmarks(st.session_state.bookmarks)
-        _clear_query_param_compat("remove_bm")
+    # Bookmarks removed
 except Exception:
     pass
 
@@ -518,7 +501,7 @@ with col_btn:
 folder = st.session_state.folder_path
 start_btn = st.sidebar.button("Start Two-Phase Indexing")
 stop_btn = st.sidebar.button("Cancel Background Tasks")
-save_idx_btn = st.sidebar.button("Save indices to disk")
+//
 concurrent_phase2 = False
 local_run_phase2 = st.sidebar.checkbox("Run captions after embeddings", value=False, key="local_fast_phase2")
 
@@ -561,22 +544,7 @@ except Exception:
 
 # Bookmarks / Export section
 st.sidebar.markdown("---")
-st.sidebar.subheader("Bookmarks / Reports")
-bm_count = len(st.session_state.bookmarks or {})
-st.sidebar.caption(f"Bookmarked: {bm_count}")
-col_csv, col_pdf = st.sidebar.columns(2)
-with col_csv:
-    try:
-        data_csv = generate_bookmarks_csv(st.session_state.bookmarks)
-        st.download_button("CSV", data=data_csv, file_name="bookmarks.csv", mime="text/csv")
-    except Exception as _:
-        st.caption(":warning: CSV export failed")
-with col_pdf:
-    try:
-        data_pdf = generate_bookmarks_pdf(st.session_state.bookmarks)
-        st.download_button("PDF", data=data_pdf, file_name="bookmarks.pdf", mime="application/pdf")
-    except Exception as _:
-        st.caption(":warning: PDF export failed")
+//
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Interactive Indexing")
@@ -659,24 +627,7 @@ if st.session_state.get("case_type") == "triage" and selected_count > 0:
 
 # Clear bookmarks/tags actions
 st.sidebar.markdown("")
-with st.sidebar.expander("Danger zone", expanded=False):
-    confirm_clear_tags = st.checkbox("Confirm clear all tags")
-    if st.button("Clear all tags"):
-        if confirm_clear_tags:
-            for _p in list(st.session_state.bookmarks.keys()):
-                st.session_state.bookmarks[_p]["tags"] = []
-            save_bookmarks(st.session_state.bookmarks)
-            st.sidebar.success("All tags cleared")
-        else:
-            st.sidebar.warning("Please confirm clear all tags")
-    confirm_clear_bm = st.checkbox("Confirm clear all bookmarks")
-    if st.button("Clear all bookmarks"):
-        if confirm_clear_bm:
-            st.session_state.bookmarks = {}
-            save_bookmarks(st.session_state.bookmarks)
-            st.sidebar.success("All bookmarks cleared")
-        else:
-            st.sidebar.warning("Please confirm clear all bookmarks")
+//
 
 # Filters
 st.sidebar.markdown("---")
@@ -1738,49 +1689,7 @@ if st.session_state.get("last_results") and st.session_state.get("embeddings") i
             else:
                 st.warning("No results to cluster.")
 
-# ----- Tags page: overview of tags and images -----
-st.markdown("---")
-st.subheader("Tags Overview")
-all_tags = {}
-for path_str, meta in (st.session_state.bookmarks or {}).items():
-    for t in (meta.get("tags") or []):
-        all_tags.setdefault(t, []).append(path_str)
-
-if not all_tags:
-    st.caption("No tags yet.")
-else:
-    # tag selection and display
-    tag_list = sorted(all_tags.keys())
-    sel_tag = st.selectbox("Select a tag to view images", ["(All)"] + tag_list, index=0)
-    cols = st.columns(5)
-    show_paths = []
-    if sel_tag == "(All)":
-        # Flatten unique paths preserving order by tag buckets
-        seen = set()
-        for t in tag_list:
-            for p in all_tags[t]:
-                if p not in seen:
-                    show_paths.append(p)
-                    seen.add(p)
-    else:
-        show_paths = all_tags.get(sel_tag, [])
-
-    for i, r in enumerate(show_paths[:50]):
-        try:
-            # reuse base64 render to avoid path issues
-            try:
-                mime, _ = mimetypes.guess_type(r)
-                mime = mime or "image/jpeg"
-                with open(r, "rb") as _f:
-                    b64 = base64.b64encode(_f.read()).decode("utf-8")
-                data_url = f"data:{mime};base64,{b64}"
-            except Exception:
-                data_url = ""
-            slot = cols[i % 5]
-            slot.markdown(f"<div class='img-card'><img src='{data_url}' /></div>", unsafe_allow_html=True)
-            slot.caption(Path(r).name)
-        except Exception:
-            cols[i % 5].write(Path(r).name)
+//
 
 def display_image_tile(tile_container, image_path):
     """Renders a single image tile with all its controls."""
