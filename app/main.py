@@ -46,7 +46,6 @@ except Exception:
 from app.embeddings import (
     load_models,
     compute_batch_embeddings,
-    preprocess_image_for_vit_clip,
     compute_clip_text_embedding,
 )
 from app.utils import (
@@ -1127,8 +1126,50 @@ with search_tab:
     if run_search:
         results = [] # Start with an empty list for new search results
         st.session_state.search_distances = {} # Clear old distances
-        vector_results = set()
-        keyword_results = set()
+
+        # If triage case, run hash-based search; otherwise run vector/keyword search
+        if st.session_state.get("case_type") == "triage":
+            hash_results_with_dist = []
+            # Defaults if triage UI is not present
+            try:
+                hash_type
+            except NameError:
+                hash_type = None
+            try:
+                hash_value
+            except NameError:
+                hash_value = None
+            try:
+                hamming_limit
+            except NameError:
+                hamming_limit = 0
+
+            if hash_type and hash_value and st.session_state.get("manifest"):
+                is_perceptual = 'hash' in (hash_type or '').lower() and 'sha' not in (hash_type or '').lower()
+
+                with st.spinner(f"Searching by {hash_type}..."):
+                    for path, item in st.session_state.manifest.items():
+                        item_hashes = item.get('hashes', {})
+                        if not item_hashes:
+                            continue
+                        target_hash = item_hashes.get(hash_type)
+                        if not target_hash:
+                            continue
+                        if is_perceptual:
+                            dist = hamming_distance(hash_value, target_hash)
+                            if dist <= hamming_limit:
+                                hash_results_with_dist.append((path, dist))
+                        else:  # Exact match
+                            if str(hash_value).lower() == str(target_hash).lower():
+                                hash_results_with_dist.append((path, 0))
+
+                # Sort results: exact matches first, then by hamming distance
+                hash_results_with_dist.sort(key=lambda x: x[1])
+                results = [path for path, dist in hash_results_with_dist]
+                st.session_state.search_distances = {path: dist for path, dist in hash_results_with_dist}
+        else:
+            vector_results = set()
+            keyword_results = set()
 
             # 1. Vector Search (FAISS)
             if nl_query and st.session_state.get("faiss_clip"):
@@ -1164,33 +1205,6 @@ with search_tab:
             final_results.extend([p for p in vector_results if p not in intersection])
             final_results.extend([p for p in keyword_results if p not in intersection])
             results = final_results
-
-        # --- Triage Mode Search Logic ---
-        elif st.session_state.get("case_type") == "triage":
-            hash_results_with_dist = []
-            if hash_type and hash_value and st.session_state.get("manifest"):
-                is_perceptual = 'hash' in (hash_type or '').lower() and 'sha' not in (hash_type or '').lower()
-
-                with st.spinner(f"Searching by {hash_type}..."):
-                    for path, item in st.session_state.manifest.items():
-                        item_hashes = item.get('hashes', {})
-                        if not item_hashes: continue
-
-                        target_hash = item_hashes.get(hash_type)
-                        if not target_hash: continue
-
-                        if is_perceptual:
-                            dist = hamming_distance(hash_value, target_hash)
-                            if dist <= hamming_distance:
-                                hash_results_with_dist.append((path, dist))
-                        else:  # Exact match
-                            if hash_value.lower() == target_hash.lower():
-                                hash_results_with_dist.append((path, 0))
-
-                # Sort results: exact matches first, then by hamming distance
-                hash_results_with_dist.sort(key=lambda x: x[1])
-                results = [path for path, dist in hash_results_with_dist]
-                st.session_state.search_distances = {path: dist for path, dist in hash_results_with_dist}
 
         st.session_state.last_results = results
 
