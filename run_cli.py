@@ -66,11 +66,11 @@ def main():
     elif device == "mps":
         use_fp16 = False
         compile_model = False
-        bs = args.batch_size
+        bs = min(args.batch_size, 8)
     else:
         use_fp16 = False
         compile_model = False
-        bs = args.batch_size
+        bs = min(args.batch_size, 8)
 
     indexer = ViTIndexer(model_name="google/vit-base-patch16-224-in21k",
                          device=device, batch_size=bs, use_fp16=use_fp16,

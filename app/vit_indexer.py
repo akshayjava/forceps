@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import List, Tuple, Optional, Generator
 import numpy as np
 import torch
+import platform
+import multiprocessing as mp
 from torch.utils.data import DataLoader, Dataset
 from transformers import ViTImageProcessor, ViTModel
 from PIL import Image
@@ -24,6 +26,12 @@ import gc
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Use a safe start method to avoid fork-related crashes on macOS
+try:
+    mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    pass
 
 class ImageDataset(Dataset):
     """Custom dataset for loading images from directory with optimizations"""
@@ -160,12 +168,19 @@ class ViTIndexer:
                              use_fp16=self.use_fp16, 
                              use_channels_last=hasattr(self, 'use_channels_last'))
         
-        # Optimization: Increase num_workers and use pin_memory for faster data loading
-        num_workers = min(8, os.cpu_count())
-        dataloader = DataLoader(dataset, batch_size=self.batch_size, 
-                              shuffle=False, num_workers=num_workers, 
-                              pin_memory=True, persistent_workers=True,
-                              prefetch_factor=2)
+        # DataLoader worker policy: use workers on CUDA only; avoid on macOS/CPU/MPS to prevent crashes
+        workers = min(8, os.cpu_count())
+        if self.device.type != 'cuda' or platform.system() == 'Darwin':
+            workers = 0
+        dl_kwargs = dict(
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=workers,
+            pin_memory=(self.device.type == 'cuda'),
+        )
+        if workers > 0:
+            dl_kwargs.update(persistent_workers=True, prefetch_factor=2)
+        dataloader = DataLoader(dataset, **dl_kwargs)
         
         all_features = []
         all_paths = []
@@ -626,18 +641,20 @@ class MultiGPUViTIndexer:
             cache_size=min(1000, len(image_paths) // 10)
         )
         
-        # Optimized DataLoader settings
-        num_workers = min(12, os.cpu_count())  # More workers for I/O bound tasks
-        dataloader = DataLoader(
-            dataset, 
+        # Optimized DataLoader settings (safe on non-CUDA)
+        workers = min(12, os.cpu_count())
+        if self.device.type != 'cuda' or platform.system() == 'Darwin':
+            workers = 0
+        dl_kwargs = dict(
             batch_size=self.batch_size,
-            shuffle=False, 
-            num_workers=num_workers,
-            pin_memory=True, 
-            persistent_workers=True,
-            prefetch_factor=4,  # More aggressive prefetching
-            drop_last=False
+            shuffle=False,
+            num_workers=workers,
+            pin_memory=(self.device.type == 'cuda'),
+            drop_last=False,
         )
+        if workers > 0:
+            dl_kwargs.update(persistent_workers=True, prefetch_factor=4)
+        dataloader = DataLoader(dataset, **dl_kwargs)
         
         # Streaming processing
         with torch.no_grad():
