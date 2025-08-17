@@ -35,5 +35,5 @@ hashing:
   - "perceptual"
 
 features:
-  enable_captions: false
+  enable_captions: true
 
