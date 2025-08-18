@@ -93,7 +93,9 @@ class ViTIndexer:
                  device: str = "auto", batch_size: int = 32, use_fp16: bool = True,
                  compile_model: bool = True, use_channels_last: bool = True,
                  enable_coreml: bool = False, use_v2_transforms: bool = False,
-                 use_webdataset: bool = False, webdataset_pattern: str = ""):
+                 use_webdataset: bool = False, webdataset_pattern: str = "",
+                 index_type: str = "auto", ivf_nlist: Optional[int] = None,
+                 faiss_threads: Optional[int] = None):
         """
         Initialize the ViT indexer
         
@@ -112,6 +114,9 @@ class ViTIndexer:
         self.use_v2_transforms = use_v2_transforms
         self.use_webdataset = use_webdataset
         self.webdataset_pattern = webdataset_pattern
+        self.index_type = index_type.lower() if isinstance(index_type, str) else "auto"
+        self.ivf_nlist = ivf_nlist
+        self.faiss_threads = faiss_threads
         
         # Load ViT model and processor
         logger.info(f"Loading ViT model: {model_name}")
@@ -742,7 +747,7 @@ class MultiGPUViTIndexer:
                     if batch_idx % 20 == 0 and self.device.type == 'cuda':
                         torch.cuda.empty_cache()
     
-    def build_optimized_faiss_index(self, features: np.ndarray, index_type: str = "IVFFlat",
+    def build_optimized_faiss_index(self, features: np.ndarray, index_type: Optional[str] = None,
                                    use_gpu_index: bool = True) -> faiss.Index:
         """Build optimized FAISS index with GPU acceleration"""
         logger.info(f"Building FAISS index with {features.shape[0]} vectors")
@@ -752,8 +757,19 @@ class MultiGPUViTIndexer:
         
         # Choose optimal index based on dataset size
         n_vectors = features.shape[0]
-        
-        if n_vectors < 10000:
+        chosen = (index_type or self.index_type or "auto").lower()
+        if chosen == "flat":
+            index = faiss.IndexFlatIP(self.embedding_dim)
+        elif chosen == "hnsw":
+            index = faiss.IndexHNSWFlat(self.embedding_dim, 32)
+            index.hnsw.efConstruction = 200
+            index.hnsw.efSearch = 64
+        elif chosen == "ivfflat":
+            nlist = self.ivf_nlist if self.ivf_nlist is not None else int(4 * np.sqrt(n_vectors))
+            nlist = min(max(nlist, 100), 65536)
+            quantizer = faiss.IndexFlatIP(self.embedding_dim)
+            index = faiss.IndexIVFFlat(quantizer, self.embedding_dim, nlist)
+        elif n_vectors < 10000:
             # Small dataset: use exact search
             index = faiss.IndexFlatIP(self.embedding_dim)
         elif index_type == "HNSW" or n_vectors < 100000:
@@ -763,7 +779,7 @@ class MultiGPUViTIndexer:
             index.hnsw.efSearch = 64
         else:
             # Large dataset: IVF with optimal clustering
-            nlist = int(4 * np.sqrt(n_vectors))  # Rule of thumb
+            nlist = self.ivf_nlist if self.ivf_nlist is not None else int(4 * np.sqrt(n_vectors))  # Rule of thumb
             nlist = min(max(nlist, 100), 65536)  # Reasonable bounds
             
             quantizer = faiss.IndexFlatIP(self.embedding_dim)
@@ -783,7 +799,10 @@ class MultiGPUViTIndexer:
             training_data = features[:training_size]
             # Optionally allow FAISS to use more CPU threads
             try:
-                faiss.omp_set_num_threads(max(1, min(os.cpu_count() or 1, 8)))
+                if self.faiss_threads is not None:
+                    faiss.omp_set_num_threads(max(1, int(self.faiss_threads)))
+                else:
+                    faiss.omp_set_num_threads(max(1, min(os.cpu_count() or 1, 8)))
             except Exception:
                 pass
             index.train(training_data)

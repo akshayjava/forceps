@@ -42,6 +42,9 @@ def main():
     parser.add_argument("--device", choices=["auto","cpu","cuda","mps"], default="auto", help="Computation device")
     parser.add_argument("--batch_size", type=int, default=int(os.environ.get("FORCEPS_BATCH", 16)), help="Batch size")
     parser.add_argument("--max_images", type=int, default=None, help="Limit number of images (for testing)")
+    parser.add_argument("--index_type", choices=["auto","flat","hnsw","ivfflat"], default="auto", help="FAISS index type")
+    parser.add_argument("--ivf_nlist", type=int, default=None, help="Override nlist for IVF")
+    parser.add_argument("--faiss_threads", type=int, default=None, help="FAISS omp thread count")
     parser.add_argument("--captions", action="store_true", help="Generate captions with Ollama llava and save to captions.tsv")
     parser.add_argument("--ollama_model", default="llava", help="Ollama model name for captions")
     parser.add_argument("--fp16", action="store_true", help="Enable FP16 (CUDA only)")
@@ -82,7 +85,9 @@ def main():
 
     indexer = ViTIndexer(model_name="google/vit-base-patch16-224-in21k",
                          device=device, batch_size=bs, use_fp16=use_fp16,
-                         compile_model=compile_model)
+                         compile_model=compile_model,
+                         index_type=args.index_type, ivf_nlist=args.ivf_nlist,
+                         faiss_threads=args.faiss_threads)
 
     # Prefer optimized path; fall back if unavailable
     try:
