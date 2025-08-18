@@ -34,9 +34,10 @@ def main():
         assert spec and spec.loader
         spec.loader.exec_module(vi)  # type: ignore
         ViTIndexer = vi.ViTIndexer
-        # Sanity: ensure optimized methods exist
-        if not hasattr(ViTIndexer, "process_images_optimized") or not hasattr(ViTIndexer, "build_optimized_faiss_index"):
-            raise ImportError("Loaded vit_indexer lacks optimized methods; ensure you pulled latest")
+        # Shim: if optimized methods landed at module level, bind them to the class
+        for name in ("build_optimized_faiss_index", "process_images_optimized", "extract_features_streaming"):
+            if not hasattr(ViTIndexer, name) and hasattr(vi, name):
+                setattr(ViTIndexer, name, getattr(vi, name))
     except Exception as exc:
         print("Import error loading", vit_indexer_path, "::", exc)
         print("Tip: git pull, then run with PYTHONPATH=. from the repo root.")
