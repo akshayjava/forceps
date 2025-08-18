@@ -24,15 +24,22 @@ from typing import Dict, Any
 from app.utils import read_exif
 
 def main():
+    # Robust import of vit_indexer by filepath to avoid package name conflicts on 'app'
+    repo_root = Path(__file__).resolve().parent
+    vit_indexer_path = repo_root / "app" / "vit_indexer.py"
     try:
-        # Ensure repo root on sys.path
-        repo_root = Path(__file__).resolve().parent
-        if str(repo_root) not in sys.path:
-            sys.path.insert(0, str(repo_root))
-        from app.vit_indexer import ViTIndexer
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("vit_indexer", str(vit_indexer_path))
+        vi = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(vi)  # type: ignore
+        ViTIndexer = vi.ViTIndexer
+        # Sanity: ensure optimized methods exist
+        if not hasattr(ViTIndexer, "process_images_optimized") or not hasattr(ViTIndexer, "build_optimized_faiss_index"):
+            raise ImportError("Loaded vit_indexer lacks optimized methods; ensure you pulled latest")
     except Exception as exc:
-        print("Import error:", exc)
-        print("Run from repo root or use: PYTHONPATH=. python3 run_cli.py")
+        print("Import error loading", vit_indexer_path, "::", exc)
+        print("Tip: git pull, then run with PYTHONPATH=. from the repo root.")
         sys.exit(1)
 
     # CLI args
