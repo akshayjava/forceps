@@ -766,33 +766,55 @@ class MultiGPUViTIndexer:
             nlist = int(4 * np.sqrt(n_vectors))  # Rule of thumb
             nlist = min(max(nlist, 100), 65536)  # Reasonable bounds
             
-            if use_gpu_index and faiss.get_num_gpus() > 0:
-                # GPU-accelerated index building
-                res = faiss.StandardGpuResources()
-                quantizer = faiss.IndexFlatIP(self.embedding_dim)
-                quantizer_gpu = faiss.index_cpu_to_gpu(res, 0, quantizer)
-                index = faiss.IndexIVFFlat(quantizer_gpu, self.embedding_dim, nlist)
-            else:
-                quantizer = faiss.IndexFlatIP(self.embedding_dim)
-                index = faiss.IndexIVFFlat(quantizer, self.embedding_dim, nlist)
+            quantizer = faiss.IndexFlatIP(self.embedding_dim)
+            index = faiss.IndexIVFFlat(quantizer, self.embedding_dim, nlist)
+            # We'll optionally move this CPU index to GPU after training
         
-        # Train if necessary
+        # Train if necessary (cap training set size; avoid excessive k-means time)
         if hasattr(index, 'is_trained') and not index.is_trained:
-            logger.info(f"Training index with {min(n_vectors, 1000000)} vectors...")
-            training_data = features[:min(n_vectors, 1000000)]  # Limit training data
+            # Heuristic: need at least ~100 samples per centroid; cap upper bound
+            if isinstance(index, faiss.IndexIVF):
+                nlist = index.nlist
+                desired = max(100 * nlist, 100_000)
+            else:
+                desired = 100_000
+            training_size = int(min(n_vectors, desired, 500_000))
+            logger.info(f"Training index with {training_size} vectors (dim={features.shape[1]})...")
+            training_data = features[:training_size]
+            # Optionally allow FAISS to use more CPU threads
+            try:
+                faiss.omp_set_num_threads(max(1, min(os.cpu_count() or 1, 8)))
+            except Exception:
+                pass
             index.train(training_data)
+            if hasattr(index, 'is_trained') and not index.is_trained:
+                logger.warning("Index failed to train; falling back to flat index")
+                index = faiss.IndexFlatIP(self.embedding_dim)
         
+        # Optionally move trained IVF to GPU for faster add, then return to CPU
+        use_gpu = use_gpu_index and faiss.get_num_gpus() > 0
+        if use_gpu and isinstance(index, faiss.IndexIVF):
+            try:
+                res = faiss.StandardGpuResources()
+                index = faiss.index_cpu_to_gpu(res, 0, index)
+                logger.info("Moved IVF index to GPU for faster add")
+            except Exception as e:
+                logger.warning(f"GPU index path unavailable, using CPU index: {e}")
+                use_gpu = False
+
         # Add vectors in batches to avoid memory issues
         logger.info("Adding vectors to index...")
-        batch_size = 50000
+        batch_size = 50_000
+        last_log = 0
         for i in range(0, n_vectors, batch_size):
             end_idx = min(i + batch_size, n_vectors)
             index.add(features[i:end_idx])
-            if i % (batch_size * 10) == 0:
+            if end_idx - last_log >= 500_000:
                 logger.info(f"Added {end_idx}/{n_vectors} vectors")
-        
-        # Move back to CPU if using GPU index
-        if use_gpu_index and faiss.get_num_gpus() > 0:
+                last_log = end_idx
+
+        # Move back to CPU if we used GPU for adding
+        if use_gpu:
             index = faiss.index_gpu_to_cpu(index)
         
         return index
@@ -809,7 +831,14 @@ class MultiGPUViTIndexer:
         if max_images:
             image_paths = image_paths[:max_images]
         discovery_time = time.time() - discovery_start
-        
+        # Total bytes processed (for summary)
+        total_bytes = 0
+        for p in image_paths:
+            try:
+                total_bytes += os.path.getsize(p)
+            except Exception:
+                pass
+
         total_images = len(image_paths)
         logger.info(f"Processing {total_images} images")
         logger.info(f"File discovery: {discovery_time:.2f}s; size: {_fmt_gb_tb(total_bytes)}")
