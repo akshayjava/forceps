@@ -373,7 +373,11 @@ class ViTIndexer:
         
         # Phase 4: FAISS Index Construction
         indexing_start = time.time()
-        index = self.build_faiss_index(combined_features)
+        index = self.build_optimized_faiss_index(
+            combined_features,
+            index_type=self.index_type,
+            use_gpu_index=(self.device.type == 'cuda')
+        )
         indexing_time = time.time() - indexing_start
         
         # Phase 5: Saving Results
