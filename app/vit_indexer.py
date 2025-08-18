@@ -371,13 +371,19 @@ class ViTIndexer:
         logger.info(f"Feature combination took: {combine_time:.2f}s")
         logger.info(f"Extracted features shape: {combined_features.shape}")
         
-        # Phase 4: FAISS Index Construction
+        # Phase 4: FAISS Index Construction (use classic builder for compatibility)
         indexing_start = time.time()
-        index = self.build_optimized_faiss_index(
-            combined_features,
-            index_type=self.index_type,
-            use_gpu_index=(self.device.type == 'cuda')
-        )
+        # Map our index_type to builder expectation
+        sel = (self.index_type or "auto").lower()
+        if sel == "hnsw":
+            itype = "HNSW"
+        elif sel == "flat":
+            itype = "FlatIP"
+        elif sel == "ivfflat":
+            itype = "IVFFlat"
+        else:
+            itype = "HNSW" if combined_features.shape[0] < 100000 else "IVFFlat"
+        index = self.build_faiss_index(combined_features, index_type=itype)
         indexing_time = time.time() - indexing_start
         
         # Phase 5: Saving Results
