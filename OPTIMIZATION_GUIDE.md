@@ -51,7 +51,43 @@ pip install whoosh pyyaml numpy
 pip install setproctitle  # For better process identification
 ```
 
-## ⚡ Quick Start for Multi-TB Processing
+## ⚡ Optimizing the Command-Line Indexer (`run_cli.py`)
+
+For single-machine indexing, the `run_cli.py` script is the most direct method. You can optimize its performance using several command-line flags.
+
+### Key Performance Flags:
+
+-   `--device <auto|cpu|cuda|mps>`: Manually set the computation device. `auto` will prefer a GPU if available. Forcing `cpu` can be useful on systems with low VRAM.
+-   `--batch_size <number>`: The number of images to process at once.
+    -   **On GPUs (cuda):** Increase this number to better saturate the GPU. A good starting point is `32` or `64`. If you get out-of-memory errors, reduce it.
+    -   **On CPUs:** A smaller batch size like `8` or `16` is typically sufficient.
+-   `--fp16` / `--no-fp16`: Enable or disable FP16 mixed-precision.
+    -   This is **enabled by default on CUDA** devices and can significantly speed up processing with a small trade-off in precision. It is disabled by default on CPU and MPS.
+-   `--compile` / `--no-compile`: Enable or disable `torch.compile`.
+    -   This can provide a 10-30% speed-up on newer NVIDIA GPUs but adds a one-time compilation overhead at the start. It is **disabled by default**.
+-   `--index_type <auto|flat|hnsw|ivfflat>`: Choose the FAISS index type.
+    -   `flat`: Brute-force search. Highest accuracy, but slowest and uses the most memory.
+    -   `ivfflat`: A good balance of speed and accuracy for large datasets.
+    -   `hnsw`: A modern graph-based index that is very fast for querying, but can be slow to build.
+-   `--faiss_threads <number>`: Set the number of threads for FAISS to use during index building. Setting this to the number of available CPU cores can speed up the final indexing step.
+
+### Example: Optimized GPU Indexing
+
+Here is an example command for a machine with a powerful NVIDIA GPU:
+```bash
+PYTHONPATH=. python3 run_cli.py \
+  --image_dir "/path/to/large_dataset" \
+  --output_dir "index_gpu_optimized" \
+  --device cuda \
+  --batch_size 64 \
+  --fp16 \
+  --compile \
+  --index_type ivfflat
+```
+
+## ⚡ Quick Start for Distributed Multi-TB Processing
+
+This section focuses on the distributed processing engine, designed for massive-scale datasets across multiple machines.
 
 ### 1. Configure the System
 
