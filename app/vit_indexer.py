@@ -267,7 +267,8 @@ class ViTIndexer:
         elif index_type == "HNSW":
             # Hierarchical NSW - very fast search, more memory
             index = faiss.IndexHNSWFlat(self.embedding_dim, 32)
-            index.hnsw.efConstruction = 200
+            # Lower efConstruction to speed up building on CPU
+            index.hnsw.efConstruction = 100
         else:  # FlatIP
             # Simple flat index - exact search
             index = faiss.IndexFlatIP(self.embedding_dim)
@@ -277,8 +278,22 @@ class ViTIndexer:
             logger.info("Training index...")
             index.train(features)
         
+        # Add with batching and progress logs to avoid perceived hangs
         logger.info("Adding vectors to index...")
-        index.add(features)
+        try:
+            # Limit FAISS to a reasonable number of threads
+            faiss.omp_set_num_threads(max(1, min(os.cpu_count() or 1, 8)))
+        except Exception:
+            pass
+        n = features.shape[0]
+        batch = 50000
+        last_report = 0
+        for i in range(0, n, batch):
+            j = min(i + batch, n)
+            index.add(features[i:j])
+            if (j - last_report) >= 200000 or j == n:
+                logger.info(f"Added {j}/{n} vectors")
+                last_report = j
         
         return index
     
