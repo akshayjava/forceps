@@ -5,64 +5,47 @@ import json
 import yaml
 import time
 import numpy as np
-import faiss
 import pickle
 from pathlib import Path
 import logging
 import redis
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import argparse
-import torch
 from PIL import Image
+import faiss
+import torch
 
-# Add app directory to sys.path to import modules
-sys.path.insert(0, os.path.abspath('./app'))
-
-# Safe import function
-def safe_import(module_name, fallback=None):
-    """Safely import a module, returning fallback if import fails"""
-    try:
-        return __import__(module_name)
-    except Exception as e:
-        return fallback
-
-# Initialize module flags
-HAS_HASHERS = False
-HAS_DISTRIBUTED_ENGINE = False
-HAS_OPTIMIZED_EMBEDDINGS = False
-HAS_EMBEDDINGS = False
-HAS_UTILS = False
-HAS_OLLAMA = False
-
-# Initialize function references
-get_hashers = None
-OptimizedRedisClient = None
-WorkerStats = None
-OptimizedEmbeddingComputer = None
-optimize_gpu_settings = None
-load_models = None
-compute_batch_embeddings = None
-fingerprint = None
-load_cache = None
-save_cache = None
-read_exif = None
-ollama_installed = None
-generate_caption_ollama = None
-model_available = None
-general_ollama_query = None
-
-# Configure logging for Streamlit
+# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Add app directory to sys.path
+sys.path.insert(0, os.path.abspath('./app'))
+
+# --- Safe Module Loading ---
 def safe_import_modules():
-    """Safely import all modules and set flags"""
-    global HAS_HASHERS, HAS_DISTRIBUTED_ENGINE, HAS_OPTIMIZED_EMBEDDINGS
-    global HAS_EMBEDDINGS, HAS_UTILS, HAS_OLLAMA
-    global get_hashers, OptimizedRedisClient, WorkerStats, OptimizedEmbeddingComputer
-    global optimize_gpu_settings, load_models, compute_batch_embeddings
-    global fingerprint, load_cache, save_cache, read_exif
+    """Safely import optional modules and set availability flags"""
+    global HAS_HASHERS, HAS_EMBEDDINGS, HAS_OLLAMA, HAS_UTILS
+    global get_hashers, load_models, compute_batch_embeddings
     global ollama_installed, generate_caption_ollama, model_available, general_ollama_query
+    global fingerprint, load_cache, save_cache, read_exif
+    
+    # Initialize flags
+    HAS_HASHERS = False
+    HAS_EMBEDDINGS = False
+    HAS_OLLAMA = False
+    HAS_UTILS = False
+    
+    # Initialize function references
+    get_hashers = None
+    load_models = None
+    compute_batch_embeddings = None
+    ollama_installed = None
+    generate_caption_ollama = None
+    model_available = None
+    general_ollama_query = None
+    fingerprint = None
+    load_cache = None
+    save_cache = None
+    read_exif = None
     
     # Try to import hashers
     try:
@@ -72,22 +55,6 @@ def safe_import_modules():
     except ImportError as e:
         st.sidebar.warning(f"❌ Hashers module: {e}")
     
-    # Try to import distributed engine
-    try:
-        from app.distributed_engine import OptimizedRedisClient, WorkerStats
-        HAS_DISTRIBUTED_ENGINE = True
-        st.sidebar.success("✅ Distributed Engine module loaded")
-    except ImportError as e:
-        st.sidebar.warning(f"❌ Distributed Engine module: {e}")
-    
-    # Try to import optimized embeddings
-    try:
-        from app.optimized_embeddings import OptimizedEmbeddingComputer, optimize_gpu_settings
-        HAS_OPTIMIZED_EMBEDDINGS = True
-        st.sidebar.success("✅ Optimized Embeddings module loaded")
-    except ImportError as e:
-        st.sidebar.warning(f"❌ Optimized Embeddings module: {e}")
-    
     # Try to import embeddings
     try:
         from app.embeddings import load_models, compute_batch_embeddings
@@ -96,14 +63,6 @@ def safe_import_modules():
     except ImportError as e:
         st.sidebar.warning(f"❌ Embeddings module: {e}")
     
-    # Try to import utils
-    try:
-        from app.utils import fingerprint, load_cache, save_cache, read_exif
-        HAS_UTILS = True
-        st.sidebar.success("✅ Utils module loaded")
-    except ImportError as e:
-        st.sidebar.warning(f"❌ Utils module: {e}")
-    
     # Try to import Ollama
     try:
         from app.llm_ollama import ollama_installed, generate_caption_ollama, model_available, general_ollama_query
@@ -111,6 +70,14 @@ def safe_import_modules():
         st.sidebar.success("✅ Ollama module loaded")
     except ImportError as e:
         st.sidebar.warning(f"❌ Ollama module: {e}")
+    
+    # Try to import utils
+    try:
+        from app.utils import fingerprint, load_cache, save_cache, read_exif
+        HAS_UTILS = True
+        st.sidebar.success("✅ Utils module loaded")
+    except ImportError as e:
+        st.sidebar.warning(f"❌ Utils module: {e}")
 
 # --- Configuration Loading ---
 @st.cache_data
@@ -130,304 +97,321 @@ config = load_config()
 if not config:
     st.stop()
 
-# --- Refactored Functions from original scripts ---
-
-def enqueue_jobs_programmatic(input_dir: str, config: dict):
-    st.info(f"Scanning for images in {input_dir} and enqueuing jobs...")
+# --- Enhanced Functions ---
+def enhanced_image_browser(input_dir):
+    """Enhanced image browser with metadata extraction"""
+    if not os.path.isdir(input_dir):
+        return []
     
-    if not HAS_HASHERS:
-        st.error("Hashers module not available. Cannot process images.")
-        return 0
-        
-    cfg_redis = config['redis']
-    cfg_perf = config['performance']['enqueuer']
-
-    hashers_to_run = config.get('hashing', [])
-    hashers = get_hashers(hashers_to_run)
-    if not hashers:
-        st.warning("No hashers configured. No hashes will be computed.")
-        return 0
-
-    try:
-        r = redis.Redis(host=cfg_redis['host'], port=cfg_redis['port'], db=0, decode_responses=True)
-        r.ping()
-        st.success(f"Successfully connected to Redis at {cfg_redis['host']}:{cfg_redis['port']}")
-    except redis.exceptions.ConnectionError as e:
-        st.error(f"Could not connect to Redis: {e}. Please ensure Redis is running.")
-        return 0
-
     image_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".webp"}
-    image_data = []
+    image_files = []
     
-    def process_single_file(file_path, hashers_list):
-        try:
-            all_hashes = {}
-            for hasher in hashers_list:
-                all_hashes.update(hasher.compute(file_path))
-            return {"path": str(file_path), "hashes": all_hashes}
-        except Exception as e:
-            logger.warning(f"Could not process file {file_path}: {e}")
-            return None
-
-    # Use a ThreadPoolExecutor to parallelize both walking and processing
-    with ThreadPoolExecutor(max_workers=cfg_perf['scan_max_workers']) as executor:
-        futures = []
-        for root, _, files in os.walk(input_dir):
-            for filename in files:
-                if Path(filename).suffix.lower() in image_extensions:
-                    file_path = Path(root) / filename
-                    futures.append(executor.submit(process_single_file, file_path, hashers))
-
-        for i, future in enumerate(as_completed(futures)):
-            result = future.result()
-            if result:
-                image_data.append(result)
-            if (i + 1) % 100 == 0: # Update progress more frequently for UI
-                st.info(f"Scanned and processed {i + 1} files...")
-
-    st.info(f"Found and processed {len(image_data)} total images.")
-
-    # Initialize progress stats in Redis
     try:
-        r.set("forceps:stats:total_images", len(image_data))
-        r.set("forceps:stats:embeddings_done", 0)
-        r.set("forceps:stats:captions_done", 0)
+        for root, dirs, files in os.walk(input_dir):
+            for file in files:
+                if Path(file).suffix.lower() in image_extensions:
+                    file_path = os.path.join(root, file)
+                    # Get basic file info
+                    try:
+                        file_size = os.path.getsize(file_path)
+                        mod_time = os.path.getmtime(file_path)
+                        image_files.append({
+                            'path': file_path,
+                            'name': file,
+                            'size': file_size,
+                            'modified': mod_time
+                        })
+                    except Exception as e:
+                        logger.warning(f"Could not get info for {file_path}: {e}")
+                        image_files.append({'path': file_path, 'name': file, 'size': 0, 'modified': 0})
     except Exception as e:
-        st.warning(f"Failed to set Redis counters: {e}")
-
-    jobs_enqueued = 0
-    for i in range(0, len(image_data), cfg_perf['job_batch_size']):
-        batch = image_data[i:i + cfg_perf['job_batch_size']]
-        r.rpush(cfg_redis['job_queue'], json.dumps(batch))
-        jobs_enqueued += 1
-
-    st.success(f"Enqueued {jobs_enqueued} jobs with a total of {len(image_data)} images to queue '{cfg_redis['job_queue']}'.")
-    return len(image_data)
-
-def run_optimized_worker_once(config: dict):
-    st.info("Starting optimized worker to process jobs from Redis...")
+        st.error(f"Error scanning directory: {e}")
     
-    if not HAS_OPTIMIZED_EMBEDDINGS:
-        st.error("Optimized embeddings module not available. Cannot process jobs.")
-        return
-        
-    cfg_redis = config['redis']
+    return image_files
+
+def enhanced_file_processor(input_dir, output_dir, use_hashers=True, use_embeddings=True):
+    """Enhanced file processor with optional ML features"""
+    st.info(f"Processing files from {input_dir} to {output_dir}")
     
-    try:
-        r = redis.Redis(host=cfg_redis['host'], port=cfg_redis['port'], db=0, decode_responses=True)
-        r.ping()
-    except redis.exceptions.ConnectionError as e:
-        st.error(f"Could not connect to Redis: {e}. Please ensure Redis is running.")
-        return
-
-    # Initialize embedding computer
-    worker_config = config.get('performance', {}).get('worker', {})
-    embedding_computer = OptimizedEmbeddingComputer(
-        max_batch_size=worker_config.get('batch_size', 128),
-        use_mixed_precision=worker_config.get('use_mixed_precision', True),
-        enable_cuda_streams=worker_config.get('enable_cuda_streams', True)
-    )
-
-    processed_count = 0
-    while True:
-        jobs = r.lrange(cfg_redis['job_queue'], 0, 0) # Peek one job
-        if not jobs:
-            break # No more jobs
-
-        # Atomically pop the job
-        _, job_data_raw = r.blpop(cfg_redis['job_queue'], timeout=1)
-        if not job_data_raw:
-            break # Should not happen if lrange showed a job, but for safety
-
-        job_data = json.loads(job_data_raw)
-        
-        try:
-            # Process the job
-            image_paths = [item['path'] for item in job_data]
-            path_to_data = {item['path']: item for item in job_data}
-            
-            results = []
-            for embedding_result in embedding_computer.compute_embeddings_streaming(
-                image_paths, 
-                batch_size=None  # Use auto-sizing
-            ):
-                path = embedding_result['path']
-                original_data = path_to_data.get(path, {})
-                
-                result = {
-                    "path": path,
-                    "combined_emb": embedding_result['combined_embedding'],
-                    "hashes": original_data.get('hashes', {})
-                }
-                if 'clip_embedding' in embedding_result:
-                    result["clip_emb"] = embedding_result['clip_embedding']
-                
-                results.append(result)
-            
-            if results:
-                r.rpush(cfg_redis['results_queue'], json.dumps(results))
-                r.incrby("forceps:stats:embeddings_done", len(results))
-                processed_count += len(results)
-                st.progress(processed_count / r.get("forceps:stats:total_images"), text=f"Processed {processed_count} embeddings...")
-
-        except Exception as e:
-            st.error(f"Error processing job: {e}")
-            # Optionally re-queue the job or move to an error queue
-            break # Stop on error for simplicity in web app
-
-    st.success(f"Optimized worker finished. Processed {processed_count} embeddings.")
-
-
-def build_index_programmatic(config: dict, case_name: str = None):
-    st.info("Building FAISS and Whoosh indexes...")
-    cfg_redis = config['redis']
-    cfg_data = config['data']
-    cfg_faiss = config['performance']['faiss']
-
-    case_name = case_name or f'case_{int(time.time())}'
-    case_output_dir = Path(cfg_data['output_dir']) / case_name
+    image_files = enhanced_image_browser(input_dir)
+    if not image_files:
+        st.warning("No image files found")
+        return None
+    
+    st.success(f"Found {len(image_files)} images")
+    
+    # Create output directory
+    case_name = f'case_{int(time.time())}'
+    case_output_dir = Path(output_dir) / case_name
     case_output_dir.mkdir(parents=True, exist_ok=True)
-
-    faiss_args = argparse.Namespace(**cfg_faiss)
-
-    try:
-        r = redis.Redis(host=cfg_redis['host'], port=cfg_redis['port'], db=0, decode_responses=True)
-        r.ping()
-    except redis.exceptions.ConnectionError as e:
-        st.error(f"Could not connect to Redis: {e}. Please ensure Redis is running.")
-        return None
-
-    all_results = []
-    while True:
-        items = r.lrange(cfg_redis['results_queue'], 0, 99)
-        if not items:
-            break
-        r.ltrim(cfg_redis['results_queue'], len(items), -1) # Remove consumed items
-        for item in items:
-            all_results.extend(json.loads(item))
-        st.info(f"Consumed {len(items)} results. Total embeddings so far: {len(all_results)}")
-        time.sleep(0.1) # Yield to Streamlit
-
-    if not all_results:
-        st.warning("No embeddings were found in the results queue. Index not built.")
-        return None
-
-    # Prepare manifest data
-    manifest_data = [{"path": res["path"], "hashes": res.get("hashes")} for res in all_results]
-
-    # Prepare embedding data
-    combined_embs = np.array([res["combined_emb"] for res in all_results], dtype=np.float32)
-    has_clip = "clip_emb" in all_results[0] if all_results else False
-    clip_embs = None
-    if has_clip:
-        clip_embs = np.array([res["clip_emb"] for res in all_results if "clip_emb" in res], dtype=np.float32)
-    n, d_comb = combined_embs.shape
-
-    # Build Vector Index (FAISS) - Simplified version of build_index_for_embeddings
-    st.info("Building vector (FAISS) index...")
-    use_gpu = torch.cuda.is_available()
-    gpu_res = faiss.GpuResources() if use_gpu else None
-
-    pca_ret = None
-    d_final = d_comb
-    if faiss_args.use_pca:
-        eff_pca_dim = max(1, min(faiss_args.pca_dim, d_comb, n))
-        pca_mat = faiss.PCAMatrix(d_comb, eff_pca_dim)
-        pca_mat.train(combined_embs[:faiss_args.train_samples])
-        pca_ret = pca_mat
-        d_final = eff_pca_dim
-
-    nlist = min(faiss_args.ivf_nlist, n // 100) if n > 100 else 1
-    nlist = max(nlist, 1)
-    pq_m = faiss_args.pq_m # Assuming pq_m is directly usable
-    quantizer = faiss.IndexFlatL2(d_final)
-    cpu_index = faiss.IndexIVFPQ(quantizer, d_final, nlist, pq_m, 8)
-
-    index_to_train = faiss.index_cpu_to_gpu(gpu_res, 0, cpu_index) if use_gpu else cpu_index
-    index_to_train.train(pca_ret.apply_py(combined_embs[:faiss_args.train_samples]) if faiss_args.use_pca else combined_embs[:faiss_args.train_samples])
-
-    add_batch_size = faiss_args.add_batch
-    for off in range(0, n, add_batch_size):
-        end = off + add_batch_size
-        batch_data = combined_embs[off:end]
-        if faiss_args.use_pca: batch_data = pca_ret.apply_py(batch_data)
-        index_to_train.add(batch_data)
-
-    final_index_comb = faiss.index_gpu_to_cpu(index_to_train) if use_gpu else index_to_train
-    final_index_comb.nprobe = min(64, max(1, nlist // 16))
-
-    index_clip = None
-    if has_clip and clip_embs is not None:
-        # Simplified clip index building, assuming no PCA for clip for now
-        _, d_clip = clip_embs.shape
-        clip_quantizer = faiss.IndexFlatL2(d_clip)
-        clip_cpu_index = faiss.IndexIVFPQ(clip_quantizer, d_clip, nlist, pq_m, 8)
-        clip_index_to_train = faiss.index_cpu_to_gpu(gpu_res, 0, clip_cpu_index) if use_gpu else clip_cpu_index
-        clip_index_to_train.train(clip_embs[:faiss_args.train_samples])
-        for off in range(0, n, add_batch_size):
-            end = off + add_batch_size
-            clip_index_to_train.add(clip_embs[off:end])
-        index_clip = faiss.index_gpu_to_cpu(clip_index_to_train) if use_gpu else clip_index_to_train
-        index_clip.nprobe = min(64, max(1, nlist // 16))
-
-    st.success("Vector index building complete.")
-
-    # Save FAISS and PCA files
-    st.info("Saving FAISS indexes and manifest...")
-    faiss.write_index(final_index_comb, str(case_output_dir / "image_index.faiss"))
-    if index_clip:
-        faiss.write_index(index_clip, str(case_output_dir / "clip.index"))
-    if pca_ret:
-        with open(case_output_dir / "pca.matrix.pkl", "wb") as f:
-            pickle.dump(pca_ret, f)
     
-    # Save image_paths.pkl and metadata.pkl
-    image_paths_only = [item['path'] for item in manifest_data]
-    with open(case_output_dir / "image_paths.pkl", "wb") as f:
-        pickle.dump(image_paths_only, f)
+    processed_data = []
     
-    # For metadata.pkl, we need to extract actual metadata if available,
-    # for now, just save a dummy or simplified version
-    # In a real scenario, this would come from the original processing
-    metadata_data = {} # Placeholder, actual metadata would be more complex
-    with open(case_output_dir / "metadata.pkl", "wb") as f:
-        pickle.dump(metadata_data, f)
-
-    # Save manifest.json for compatibility/inspection
-    with open(case_output_dir / "manifest.json", "w") as f:
-        json.dump(manifest_data, f, indent=2)
-
-    st.success(f"Index building complete for case '{case_name}'. Saved to {case_output_dir}")
-    return case_output_dir
-
-def run_captions_programmatic(image_paths: list, config: dict):
-    st.info("Starting caption generation (Phase 2)...")
+    # Process with hashers if available
+    if use_hashers and HAS_HASHERS:
+        st.info("Computing image hashes...")
+        try:
+            hashers_to_run = config.get('hashing', [])
+            hashers = get_hashers(hashers_to_run)
+            if hashers:
+                for img_info in image_files:
+                    try:
+                        all_hashes = {}
+                        for hasher in hashers:
+                            all_hashes.update(hasher.compute(img_info['path']))
+                        img_info['hashes'] = all_hashes
+                    except Exception as e:
+                        logger.warning(f"Could not compute hashes for {img_info['path']}: {e}")
+                        img_info['hashes'] = {}
+        except Exception as e:
+            st.warning(f"Hash computation failed: {e}")
     
-    if not HAS_OLLAMA:
-        st.warning("Ollama module not available. Skipping captioning.")
-        return
+    # Process with embeddings if available
+    if use_embeddings and HAS_EMBEDDINGS:
+        st.info("Computing image embeddings...")
+        try:
+            vit_model, clip_model, preprocess_vit, preprocess_clip, vit_dim, clip_dim = load_models()
+            
+            # Process images in batches
+            batch_size = 32
+            for i in range(0, len(image_files), batch_size):
+                batch = image_files[i:i + batch_size]
+                batch_paths = [img['path'] for img in batch]
+                
+                try:
+                    # Preprocess images
+                    vit_tensors = []
+                    for img_path in batch_paths:
+                        try:
+                            img = Image.open(img_path).convert("RGB")
+                            vit_tensor = preprocess_vit(img)
+                            vit_tensors.append(vit_tensor)
+                        except Exception as e:
+                            logger.warning(f"Could not preprocess {img_path}: {e}")
+                            vit_tensors.append(None)
+                    
+                    # Compute embeddings for valid tensors
+                    valid_tensors = [t for t in vit_tensors if t is not None]
+                    if valid_tensors:
+                        query_emb, _ = compute_batch_embeddings(valid_tensors, [], vit_model, None)
+                        
+                        # Assign embeddings back to image files
+                        emb_idx = 0
+                        for j, img_info in enumerate(batch):
+                            if vit_tensors[j] is not None:
+                                img_info['embedding'] = query_emb[emb_idx].astype(np.float32)
+                                emb_idx += 1
+                
+                except Exception as e:
+                    st.warning(f"Embedding computation failed for batch {i//batch_size + 1}: {e}")
+                
+                st.progress((i + batch_size) / len(image_files), text=f"Processed {min(i + batch_size, len(image_files))} embeddings...")
         
-    if not ollama_installed() or not model_available("llava"):
-        st.warning("Ollama or llava model not available. Skipping captioning. Please ensure Ollama is running and 'llava' model is pulled.")
-        return
+        except Exception as e:
+            st.warning(f"Embedding computation failed: {e}")
+    
+    # Save processed data
+    try:
+        # Save image paths
+        image_paths_only = [img['path'] for img in image_files]
+        with open(case_output_dir / "image_paths.pkl", "wb") as f:
+            pickle.dump(image_paths_only, f)
+        
+        # Save full metadata
+        with open(case_output_dir / "metadata.pkl", "wb") as f:
+            pickle.dump(image_files, f)
+        
+        # Create manifest
+        manifest_data = []
+        for img in image_files:
+            manifest_entry = {
+                "path": img['path'],
+                "name": img['name'],
+                "size": img['size'],
+                "modified": img['modified']
+            }
+            if 'hashes' in img:
+                manifest_entry['hashes'] = img['hashes']
+            if 'embedding' in img:
+                manifest_entry['has_embedding'] = True
+            manifest_data.append(manifest_entry)
+        
+        with open(case_output_dir / "manifest.json", "w") as f:
+            json.dump(manifest_data, f, indent=2)
+        
+        # Build FAISS index if embeddings are available
+        if use_embeddings and HAS_EMBEDDINGS:
+            embeddings_list = [img['embedding'] for img in image_files if 'embedding' in img]
+            if embeddings_list:
+                st.info("Building FAISS index...")
+                try:
+                    embeddings_array = np.array(embeddings_list, dtype=np.float32)
+                    n, d = embeddings_array.shape
+                    
+                    # Create simple flat index
+                    index = faiss.IndexFlatL2(d)
+                    index.add(embeddings_array)
+                    
+                    # Save index
+                    faiss.write_index(index, str(case_output_dir / "image_index.faiss"))
+                    st.success(f"FAISS index built with {n} vectors of dimension {d}")
+                except Exception as e:
+                    st.warning(f"FAISS index building failed: {e}")
+        
+        st.success(f"Processed {len(image_files)} files to {case_output_dir}")
+        return case_output_dir
+        
+    except Exception as e:
+        st.error(f"Error saving files: {e}")
+        return None
 
-    max_workers = config["performance"]["worker"]["max_workers"]
+def simple_redis_check(host, port):
+    """Simple Redis connection check"""
+    try:
+        r = redis.Redis(host=host, port=port, db=0, decode_responses=True)
+        r.ping()
+        return True, r
+    except Exception as e:
+        return False, str(e)
+
+def enhanced_image_search(query_image, case_dir):
+    """Enhanced image search using FAISS index"""
+    if not HAS_EMBEDDINGS:
+        st.error("Embeddings module not available. Cannot perform image search.")
+        return
     
-    # Dummy args object for phase2_caption
-    class Args:
-        def __init__(self, mw: int):
-            self.max_workers = mw
+    try:
+        # Load index and metadata
+        index_path = case_dir / "image_index.faiss"
+        metadata_path = case_dir / "metadata.pkl"
+        
+        if not index_path.exists():
+            st.error("No FAISS index found. Please rebuild the case with embeddings enabled.")
+            return
+        
+        with open(metadata_path, "rb") as f:
+            image_metadata = pickle.load(f)
+        
+        index = faiss.read_index(str(index_path))
+        st.info(f"Loaded index with {index.ntotal} vectors.")
+        
+        # Process query image
+        try:
+            vit_model, clip_model, preprocess_vit, preprocess_clip, vit_dim, clip_dim = load_models()
+            
+            # Preprocess query image
+            img = Image.open(query_image).convert("RGB")
+            vit_tensor = preprocess_vit(img)
+            query_emb, _ = compute_batch_embeddings([vit_tensor], [], vit_model, None)
+            query_vector = query_emb[0].astype(np.float32)
+            
+            # Normalize query vector
+            query_vector = query_vector / (np.linalg.norm(query_vector) + 1e-10)
+            
+            # Perform search
+            k = min(10, index.ntotal)  # Top k results
+            distances, indices = index.search(np.array([query_vector]), k)
+            
+            st.subheader(f"Top {k} Similar Images:")
+            for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
+                if idx >= 0 and idx < len(image_metadata):
+                    result_img = image_metadata[idx]
+                    result_path = result_img['path']
+                    
+                    col1, col2 = st.columns([1, 3])
+                    with col1:
+                        try:
+                            st.image(result_path, caption=f"Rank {i+1}", width=150)
+                        except Exception as e:
+                            st.write(f"Error loading image: {e}")
+                    
+                    with col2:
+                        st.write(f"**Rank {i+1}** - Similarity: {dist:.3f}")
+                        st.write(f"**File:** {Path(result_path).name}")
+                        st.write(f"**Size:** {result_img.get('size', 'Unknown'):,} bytes")
+                        if 'hashes' in result_img and result_img['hashes']:
+                            st.write(f"**Hashes:** {len(result_img['hashes'])} computed")
+                        if 'embedding' in result_img:
+                            st.write("**Embedding:** ✅ Available")
+                else:
+                    st.write(f"**Rank {i+1}** - Invalid index: {idx}")
+        
+        except Exception as e:
+            st.error(f"Error processing query image: {e}")
     
-    # Use the actual phase2_caption from app.engine
-    from app.engine import phase2_caption
-    phase2_caption(image_paths, Args(max_workers))
-    st.success("Caption generation complete.")
+    except Exception as e:
+        st.error(f"Error during image search: {e}")
+
+def enhanced_text_search(query_text, case_dir):
+    """Enhanced text search through image metadata"""
+    if not HAS_UTILS:
+        st.error("Utils module not available. Cannot perform text search.")
+        return
+    
+    try:
+        metadata_path = case_dir / "metadata.pkl"
+        with open(metadata_path, "rb") as f:
+            image_metadata = pickle.load(f)
+        
+        st.info(f"Searching through {len(image_metadata)} images for: '{query_text}'")
+        
+        # Simple text search through file names and paths
+        query_lower = query_text.lower()
+        found_results = []
+        
+        for img in image_metadata:
+            # Search in filename
+            if query_lower in img['name'].lower():
+                found_results.append(img)
+                continue
+            
+            # Search in full path
+            if query_lower in img['path'].lower():
+                found_results.append(img)
+                continue
+            
+            # Search in cached metadata if available
+            try:
+                fp = fingerprint(Path(img['path']))
+                cached_data = load_cache(fp)
+                if cached_data and "metadata" in cached_data:
+                    metadata = cached_data["metadata"]
+                    # Search in caption
+                    if "caption" in metadata and query_lower in metadata["caption"].lower():
+                        found_results.append(img)
+                        continue
+                    # Search in other metadata fields
+                    for key, value in metadata.items():
+                        if isinstance(value, str) and query_lower in value.lower():
+                            found_results.append(img)
+                            break
+            except Exception:
+                pass
+        
+        if found_results:
+            st.subheader(f"Found {len(found_results)} matching images:")
+            cols = st.columns(3)
+            for i, result in enumerate(found_results[:9]):  # Show first 9
+                col_idx = i % 3
+                with cols[col_idx]:
+                    try:
+                        st.image(result['path'], caption=result['name'], width=150)
+                        st.write(f"**{result['name']}**")
+                        if 'hashes' in result and result['hashes']:
+                            st.write(f"Hashes: {len(result['hashes'])}")
+                    except Exception as e:
+                        st.write(f"Error loading {result['name']}: {e}")
+        else:
+            st.info("No matching images found.")
+    
+    except Exception as e:
+        st.error(f"Error during text search: {e}")
 
 # --- Streamlit UI ---
-st.set_page_config(layout="wide", page_title="FORCEPS Lite")
+st.set_page_config(layout="wide", page_title="FORCEPS Enhanced")
 
-st.title("FORCEPS Lite Web App")
-st.info("This app is running in safe mode with graceful error handling for missing modules.")
+st.title("FORCEPS Enhanced - With Querying")
+st.info("Enhanced version with ML capabilities and querying functionality.")
 
 # Safely import modules after Streamlit is initialized
 with st.spinner("Loading modules safely..."):
@@ -435,223 +419,131 @@ with st.spinner("Loading modules safely..."):
 
 st.sidebar.header("Configuration")
 input_dir_default = config['data']['input_dir']
-input_dir = st.sidebar.text_input("Image Directory for Indexing", value=input_dir_default)
+input_dir = st.sidebar.text_input("Image Directory", value=input_dir_default)
 output_dir_default = config['data']['output_dir']
-output_dir = st.sidebar.text_input("Output Directory for Indexes", value=output_dir_default)
+output_dir = st.sidebar.text_input("Output Directory", value=output_dir_default)
+
+st.sidebar.markdown("---")
+st.sidebar.header("System Status")
+
+# Check Redis
+redis_host = config['redis']['host']
+redis_port = config['redis']['port']
+redis_ok, redis_result = simple_redis_check(redis_host, redis_port)
+
+if redis_ok:
+    st.sidebar.success(f"✅ Redis: {redis_host}:{redis_port}")
+    try:
+        total_images = redis_result.get("forceps:stats:total_images") or 0
+        st.sidebar.info(f"Total Images: {total_images}")
+    except:
+        pass
+else:
+    st.sidebar.error(f"❌ Redis: {redis_result}")
+
+# Check directories
+if os.path.isdir(input_dir):
+    st.sidebar.success(f"✅ Input: {input_dir}")
+else:
+    st.sidebar.error(f"❌ Input: {input_dir}")
+
+if os.path.isdir(output_dir):
+    st.sidebar.success(f"✅ Output: {output_dir}")
+else:
+    st.sidebar.error(f"❌ Output: {output_dir}")
 
 st.sidebar.markdown("---")
 st.sidebar.header("Module Status")
 st.sidebar.write(f"**Hashers**: {'✅' if HAS_HASHERS else '❌'}")
-st.sidebar.write(f"**Distributed Engine**: {'✅' if HAS_DISTRIBUTED_ENGINE else '❌'}")
-st.sidebar.write(f"**Optimized Embeddings**: {'✅' if HAS_OPTIMIZED_EMBEDDINGS else '❌'}")
 st.sidebar.write(f"**Embeddings**: {'✅' if HAS_EMBEDDINGS else '❌'}")
-st.sidebar.write(f"**Utils**: {'✅' if HAS_UTILS else '❌'}")
 st.sidebar.write(f"**Ollama**: {'✅' if HAS_OLLAMA else '❌'}")
+st.sidebar.write(f"**Utils**: {'✅' if HAS_UTILS else '❌'}")
 
-st.sidebar.markdown("---")
-st.sidebar.header("Redis Status")
-redis_host = config['redis']['host']
-redis_port = config['redis']['port']
-try:
-    r_check = redis.Redis(host=redis_host, port=redis_port, db=0, decode_responses=True)
-    r_check.ping()
-    st.sidebar.success(f"Connected to Redis at {redis_host}:{redis_port}")
-    total_images = r_check.get("forceps:stats:total_images") or 0
-    embeddings_done = r_check.get("forceps:stats:embeddings_done") or 0
-    captions_done = r_check.get("forceps:stats:captions_done") or 0
-    st.sidebar.info(f"Total Images: {total_images}, Embeddings Done: {embeddings_done}, Captions Done: {captions_done}")
-except Exception:
-    st.sidebar.error(f"Could not connect to Redis at {redis_host}:{redis_port}. Please start Redis.")
+st.header("1. Enhanced File Processing")
+st.write("Process images with optional ML features (hashing, embeddings).")
 
-st.header("1. Build Index and Captions")
-st.write("This process will scan your image directory, compute embeddings, build a searchable index, and generate captions using Ollama (if configured).")
+col1, col2 = st.columns(2)
+with col1:
+    use_hashers = st.checkbox("Use Hashers", value=HAS_HASHERS, disabled=not HAS_HASHERS)
+    if not HAS_HASHERS:
+        st.info("Hashers module not available")
+with col2:
+    use_embeddings = st.checkbox("Use Embeddings", value=HAS_EMBEDDINGS, disabled=not HAS_EMBEDDINGS)
+    if not HAS_EMBEDDINGS:
+        st.info("Embeddings module not available")
 
-if not HAS_HASHERS or not HAS_OPTIMIZED_EMBEDDINGS:
-    st.warning("⚠️ Some required modules are not available. Full indexing functionality may be limited.")
-    st.info("Available modules will be used where possible.")
-
-if st.button("Start Indexing and Captioning"):
+if st.button("Process Images with ML Features"):
     if not os.path.isdir(input_dir):
         st.error(f"Input directory '{input_dir}' does not exist.")
-    elif not HAS_HASHERS:
-        st.error("Hashers module not available. Cannot process images.")
-    elif not HAS_OPTIMIZED_EMBEDDINGS:
-        st.error("Optimized embeddings module not available. Cannot process jobs.")
     else:
-        st.session_state.indexing_case_dir = None
-        with st.spinner("Starting indexing and captioning..."):
-            try:
-                # Step 1: Enqueue Jobs
-                total_images_found = enqueue_jobs_programmatic(input_dir, config)
-                if total_images_found > 0:
-                    # Step 2: Run Worker to process jobs
-                    run_optimized_worker_once(config)
-                    
-                    # Step 3: Build Index
-                    case_output_path = build_index_programmatic(config)
-                    st.session_state.indexing_case_dir = case_output_path
-                    
-                    # Step 4: Generate Captions
-                    if case_output_path and HAS_OLLAMA:
-                        # Need to load image paths from the newly built index
-                        try:
-                            with open(case_output_path / "image_paths.pkl", "rb") as f:
-                                indexed_image_paths = pickle.load(f)
-                            run_captions_programmatic(indexed_image_paths, config)
-                        except Exception as e:
-                            st.error(f"Error loading indexed image paths for captioning: {e}")
-                    st.success("Indexing and Captioning process completed!")
-                else:
-                    st.warning("No images found or jobs enqueued. Indexing skipped.")
-            except Exception as e:
-                st.error(f"Error during indexing: {e}")
-                st.info("Check the module status in the sidebar to see which components are available.")
+        with st.spinner("Processing images with ML features..."):
+            case_dir = enhanced_file_processor(input_dir, output_dir, use_hashers, use_embeddings)
+            if case_dir:
+                st.session_state.case_dir = case_dir
+                st.success("Enhanced processing completed!")
 
-st.header("2. Search by Image")
-st.write("Upload an image to find similar images in your indexed collection.")
+st.header("2. Image Search")
+st.write("Search for similar images using the FAISS index.")
 
-uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png", "bmp", "gif", "tiff", "webp"])
-
-if uploaded_file is not None:
-    if 'indexing_case_dir' not in st.session_state or not st.session_state.indexing_case_dir:
-        st.warning("Please build an index first in 'Build Index and Captions' section.")
+if 'case_dir' in st.session_state and st.session_state.case_dir:
+    case_dir = st.session_state.case_dir
+    
+    # Check if index exists
+    index_path = case_dir / "image_index.faiss"
+    if index_path.exists():
+        st.success(f"FAISS index available: {index_path}")
+        
+        uploaded_file = st.file_uploader("Choose an image to search for...", type=["jpg", "jpeg", "png", "bmp", "gif", "tiff", "webp"])
+        
+        if uploaded_file is not None:
+            st.image(uploaded_file, caption='Query Image', use_container_width=True)
+            
+            if st.button("Search for Similar Images"):
+                enhanced_image_search(uploaded_file, case_dir)
     else:
-        st.image(uploaded_file, caption='Uploaded Image', use_column_width=True)
-        st.write("")
-        st.write("Searching...")
+        st.warning("No FAISS index found. Please process images with embeddings enabled.")
+else:
+    st.info("No case loaded. Process images first to enable search functionality.")
 
-        if not HAS_EMBEDDINGS:
-            st.error("Embeddings module not available. Cannot perform image search.")
-        else:
-            # Load models for query
-            vit_model, clip_model, preprocess_vit, preprocess_clip, vit_dim, clip_dim = load_models()
+st.header("3. Text Search")
+st.write("Search through image metadata and cached information.")
 
-            # Load index and image paths from the last built index
-            case_dir = st.session_state.indexing_case_dir
-            try:
-                index_path = case_dir / "image_index.faiss"
-                with open(case_dir / "image_paths.pkl", "rb") as f:
-                    image_paths = pickle.load(f)
-                
-                index = faiss.read_index(str(index_path))
-                st.info(f"Loaded index with {index.ntotal} vectors.")
+if 'case_dir' in st.session_state and st.session_state.case_dir:
+    case_dir = st.session_state.case_dir
+    
+    text_query = st.text_input("Enter search terms:")
+    if text_query:
+        if st.button("Search"):
+            enhanced_text_search(text_query, case_dir)
+else:
+    st.info("No case loaded. Process images first to enable text search.")
 
-                # Preprocess and compute embedding for uploaded image
-                img = Image.open(uploaded_file).convert("RGB")
-                vit_tensor = preprocess_vit(img)
-                query_emb, _ = compute_batch_embeddings([vit_tensor], [], vit_model, None)
-                query_vector = query_emb[0].astype(np.float32)
-                query_vector = query_vector / (np.linalg.norm(query_vector) + 1e-10) # Normalize
-
-                # Perform search
-                distances, indices = index.search(np.array([query_vector]), 10) # Top 10 results
-
-                st.subheader("Top 10 Similar Images:")
-                for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
-                    if idx >= 0 and idx < len(image_paths):
-                        result_path = image_paths[idx]
-                        st.write(f"**{i+1}.** {Path(result_path).name} (Similarity: {dist:.3f})")
-                        st.image(result_path, width=100)
-                    else:
-                        st.write(f"**{i+1}.** Invalid index: {idx}")
-
-            except Exception as e:
-                st.error(f"Error during image search: {e}")
-
-st.header("3. Query Captions or Ollama")
-st.write("Search through generated captions or query the Ollama LLM directly.")
-
-query_type = st.radio("Select Query Type", ("Caption Search", "Ollama Query"))
-text_query = st.text_input("Enter your query here:")
-
-if text_query:
-    if query_type == "Caption Search":
-        if 'indexing_case_dir' not in st.session_state or not st.session_state.indexing_case_dir:
-            st.warning("Please build an index first to search captions.")
-        else:
-            st.write(f"Searching captions for: '{text_query}'")
-            case_dir = st.session_state.indexing_case_dir
-            # For simplicity, we'll do a basic text search on cached captions
-            # A proper Whoosh index search would be more robust
-            try:
-                # This part needs to load all cached metadata and search
-                # For now, let's assume metadata.pkl contains paths and captions
-                # This is a simplified approach, a real Whoosh search would be better
-                st.info("Performing basic caption search. For large datasets, a dedicated text index is recommended.")
-                
-                if not HAS_UTILS:
-                    st.error("Utils module not available. Cannot search captions.")
-                else:
-                    # Re-load image_paths to iterate and check cache
-                    with open(case_dir / "image_paths.pkl", "rb") as f:
-                        indexed_image_paths = pickle.load(f)
-                    
-                    found_results = []
-                    for img_path in indexed_image_paths:
-                        fp = fingerprint(Path(img_path))
-                        cached_data = load_cache(fp)
-                        if cached_data and "metadata" in cached_data and "caption" in cached_data["metadata"]:
-                            caption = cached_data["metadata"]["caption"]
-                            if text_query.lower() in caption.lower():
-                                found_results.append({"path": img_path, "caption": caption})
-                    
-                    if found_results:
-                        st.subheader("Matching Captions:")
-                        for res in found_results:
-                            st.write(f"**Image:** {Path(res['path']).name}")
-                            st.write(f"**Caption:** {res['caption']}")
-                            st.image(res['path'], width=100)
-                    else:
-                        st.info("No matching captions found.")
-
-            except Exception as e:
-                st.error(f"Error during caption search: {e}")
-
-    elif query_type == "Ollama Query":
-        st.write(f"Querying Ollama with: '{text_query}'")
-        if not HAS_OLLAMA:
-            st.error("Ollama module not available. Cannot query LLM.")
-        elif not ollama_installed():
-            st.warning("Ollama is not installed or not in PATH. Cannot query LLM.")
-        elif not model_available("llama2"): # Assuming llama2 is the model for general queries
-            st.warning("Llama2 model not available. Please pull 'llama2' model for Ollama queries.")
-        else:
-            with st.spinner("Getting response from Ollama..."):
-                try:
-                    response = general_ollama_query(text_query)
-                    st.write("---")
-                    st.write(response)
-                except Exception as e:
-                    st.error(f"Error querying Ollama: {e}")
-
-st.header("4. Simple File Browser (Demo Mode)")
-st.write("Browse and view images from your input directory without requiring complex modules.")
+st.header("4. Image Browser")
+st.write("Browse and view images in your input directory.")
 
 if os.path.isdir(input_dir):
-    st.subheader(f"Images in {input_dir}")
-    
-    # Simple file browser
-    image_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".webp"}
-    image_files = []
-    
-    for root, dirs, files in os.walk(input_dir):
-        for file in files:
-            if Path(file).suffix.lower() in image_extensions:
-                image_files.append(os.path.join(root, file))
+    image_files = enhanced_image_browser(input_dir)
     
     if image_files:
         st.success(f"Found {len(image_files)} images")
         
-        # Show first few images
+        # Show file list with metadata
+        if st.checkbox("Show detailed file list"):
+            for i, img in enumerate(image_files[:20]):  # Show first 20
+                st.write(f"{i+1}. {img['name']} ({img['size']:,} bytes)")
+        
+        # Show sample images
         if st.button("Show Sample Images"):
             cols = st.columns(3)
-            for i, img_path in enumerate(image_files[:9]):  # Show first 9
+            for i, img in enumerate(image_files[:9]):  # Show first 9
                 col_idx = i % 3
                 with cols[col_idx]:
                     try:
-                        st.image(img_path, caption=Path(img_path).name, width=150)
+                        st.image(img['path'], caption=img['name'], width=150)
+                        st.write(f"**{img['name']}**")
+                        st.write(f"Size: {img['size']:,} bytes")
                     except Exception as e:
-                        st.write(f"Error loading {Path(img_path).name}: {e}")
+                        st.write(f"Error loading {img['name']}: {e}")
     else:
         st.info("No image files found in the input directory.")
 else:
@@ -665,10 +557,18 @@ with col1:
     st.subheader("Python Environment")
     st.write(f"**Python Version**: {sys.version}")
     st.write(f"**Working Directory**: {os.getcwd()}")
+    st.write(f"**Input Directory**: {input_dir}")
+    st.write(f"**Output Directory**: {output_dir}")
     
 with col2:
     st.subheader("Available Libraries")
     st.write(f"**FAISS**: {'Available' if faiss else 'Not Available'}")
     st.write(f"**PyTorch**: {'Available' if torch else 'Not Available'}")
-    st.write(f"**PIL**: Available")
-    st.write(f"**Redis**: Available")
+    st.write("✅ PIL (Pillow)")
+    st.write("✅ Redis")
+    st.write("✅ NumPy")
+    st.write("✅ Pathlib")
+
+st.sidebar.markdown("---")
+if st.sidebar.button("Exit App"):
+    st.stop()

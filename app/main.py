@@ -35,6 +35,7 @@ import redis
 import json
 import pickle
 import yaml
+import torch
 from whoosh.index import open_dir as open_whoosh_dir
 from whoosh.qparser import QueryParser
 from sklearn.cluster import MiniBatchKMeans
@@ -43,25 +44,70 @@ try:
 except Exception:
     pass
 
-from app.embeddings import (
-    load_models,
-    compute_batch_embeddings,
-    compute_clip_text_embedding,
-)
-from app.utils import (
-    is_image_file,
-    fingerprint,
-    load_cache,
-    save_cache,
-    compute_perceptual_hashes,
-    read_exif,
-    _gather_metadata_for_path,
-    hamming_distance,
-    load_bookmarks,
-    save_bookmarks,
-    generate_bookmarks_pdf,
-)
-from app.llm_ollama import ollama_installed, generate_caption_ollama, model_available
+# --- Safe Module Loading ---
+def safe_import_modules():
+    """Safely import optional modules and set availability flags"""
+    global HAS_EMBEDDINGS, HAS_UTILS, HAS_OLLAMA
+    global load_models, compute_batch_embeddings, compute_clip_text_embedding
+    global is_image_file, fingerprint, load_cache, save_cache, compute_perceptual_hashes
+    global read_exif, _gather_metadata_for_path, hamming_distance
+    global load_bookmarks, save_bookmarks, generate_bookmarks_pdf
+    global ollama_installed, generate_caption_ollama, model_available
+    
+    # Initialize flags
+    HAS_EMBEDDINGS = False
+    HAS_UTILS = False
+    HAS_OLLAMA = False
+    
+    # Initialize function references
+    load_models = None
+    compute_batch_embeddings = None
+    compute_clip_text_embedding = None
+    is_image_file = None
+    fingerprint = None
+    load_cache = None
+    save_cache = None
+    compute_perceptual_hashes = None
+    read_exif = None
+    _gather_metadata_for_path = None
+    hamming_distance = None
+    load_bookmarks = None
+    save_bookmarks = None
+    generate_bookmarks_pdf = None
+    ollama_installed = None
+    generate_caption_ollama = None
+    model_available = None
+    
+    # Try to import embeddings
+    try:
+        from app.embeddings import load_models, compute_batch_embeddings, compute_clip_text_embedding
+        HAS_EMBEDDINGS = True
+        st.sidebar.success("✅ Embeddings module loaded")
+    except ImportError as e:
+        st.sidebar.warning(f"❌ Embeddings module: {e}")
+    
+    # Try to import utils
+    try:
+        from app.utils import (
+            is_image_file, fingerprint, load_cache, save_cache, compute_perceptual_hashes,
+            read_exif, _gather_metadata_for_path, hamming_distance,
+            load_bookmarks, save_bookmarks, generate_bookmarks_pdf
+        )
+        HAS_UTILS = True
+        st.sidebar.success("✅ Utils module loaded")
+    except ImportError as e:
+        st.sidebar.warning(f"❌ Utils module: {e}")
+    
+    # Try to import Ollama
+    try:
+        from app.llm_ollama import ollama_installed, generate_caption_ollama, model_available
+        HAS_OLLAMA = True
+        st.sidebar.success("✅ Ollama module loaded")
+    except ImportError as e:
+        st.sidebar.warning(f"❌ Ollama module: {e}")
+
+# Import modules safely after function definition
+safe_import_modules()
 
 # ---------------- Config ----------------
 CACHE_DIR = Path("./cache")
@@ -108,9 +154,22 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Load models (ViT + CLIP)
-vit_model, clip_model, preprocess_vit, preprocess_clip, vit_dim, clip_dim = load_models()
-COMBINED_DIM = vit_dim + clip_dim
+# Safe mode info
+st.info("This app is running in safe mode with graceful error handling for missing modules.")
+
+# Load models (ViT + CLIP) - safely
+if HAS_EMBEDDINGS:
+    try:
+        vit_model, clip_model, preprocess_vit, preprocess_clip, vit_dim, clip_dim = load_models()
+        COMBINED_DIM = vit_dim + clip_dim
+    except Exception as e:
+        st.error(f"Error loading models: {e}")
+        vit_model, clip_model, preprocess_vit, preprocess_clip, vit_dim, clip_dim = None, None, None, None, 0, 0
+        COMBINED_DIM = 0
+else:
+    st.warning("Embeddings module not available. ML features will be disabled.")
+    vit_model, clip_model, preprocess_vit, preprocess_clip, vit_dim, clip_dim = None, None, None, None, 0, 0
+    COMBINED_DIM = 0
 
 # --- Minimal Mode (fast, in-memory, no Redis/queues) ---
 st.sidebar.markdown("### Minimal Mode")
@@ -185,99 +244,111 @@ if min_mode:
         return str(dst)
 
     if st.sidebar.button("Pre-resize to 224 and use cache", key="min_preresize") and folder_min:
-        folder_min = _preresize_to_cache(folder_min, 224, io_workers_ctl)
-        st.sidebar.success(f"Using cached resized folder: {folder_min}")
+        if not HAS_UTILS:
+            st.sidebar.error("Utils module not available for image processing")
+        else:
+            folder_min = _preresize_to_cache(folder_min, 224, io_workers_ctl)
+            st.sidebar.success(f"Using cached resized folder: {folder_min}")
 
     start_min = st.sidebar.button("Index Now", key="min_start")
     pbar = st.sidebar.progress(0)
     status = st.sidebar.empty()
 
     if start_min and folder_min:
-        import faiss
-        imgs = []
-        exts = {".jpg",".jpeg",".png",".bmp",".tiff",".webp"}
-        for r,_,files in os.walk(folder_min):
-            for fn in files:
-                if Path(fn).suffix.lower() in exts:
-                    imgs.append(os.path.join(r, fn))
-
-        if not imgs:
-            st.warning("No images found.")
+        if not HAS_EMBEDDINGS:
+            st.sidebar.error("Embeddings module not available for indexing")
         else:
-            batch = int(batch_size_ctl)
-            all_embs = []
-            total = len(imgs)
-            done = 0
-            from concurrent.futures import ThreadPoolExecutor
-            for i in range(0, total, batch):
-                batch_paths = imgs[i:i+batch]
-                # threaded load
-                tensors = [None]*len(batch_paths)
-                def _load(ix_p):
-                    ix, p = ix_p
-                    try:
-                        im = Image.open(p).convert("RGB")
-                    except Exception:
-                        im = Image.new("RGB", (224,224))
-                    tensors[ix] = preprocess_vit(im)
-                with ThreadPoolExecutor(max_workers=int(io_workers_ctl)) as ex:
-                    list(ex.map(_load, enumerate(batch_paths)))
-                # Load models per selected backbone
-                vm, cm, pv, pc, vd, cd = load_models(model_choice)
-                embs, _ = compute_batch_embeddings(tensors, [], vm, None)
-                # normalize for IP
-                embs = embs / (np.linalg.norm(embs, axis=1, keepdims=True) + 1e-10)
-                all_embs.append(embs.astype(np.float32))
-                done = min(total, i+batch)
-                pct = int(done*100/total)
-                pbar.progress(pct)
-                status.text(f"Embeddings {pct}% ({done}/{total})")
+            import faiss
+            imgs = []
+            exts = {".jpg",".jpeg",".png",".bmp",".tiff",".webp"}
+            for r,_,files in os.walk(folder_min):
+                for fn in files:
+                    if Path(fn).suffix.lower() in exts:
+                        imgs.append(os.path.join(r, fn))
 
-            embs_mat = np.vstack(all_embs)
-            if use_ivfpq:
-                d = embs_mat.shape[1]
-                nlist = int(nlist_ctl)
-                pqm = int(pqm_ctl)
-                quant = faiss.IndexFlatIP(d)
-                ivfpq = faiss.IndexIVFPQ(quant, d, nlist, pqm, 8)
-                # train on a subset
-                train_n = min(embs_mat.shape[0], max(4096, nlist*4))
-                ivfpq.train(embs_mat[:train_n])
-                ivfpq.add(embs_mat)
-                idx = ivfpq
+            if not imgs:
+                st.warning("No images found.")
             else:
-                idx = faiss.IndexFlatIP(embs_mat.shape[1])
-                idx.add(embs_mat)
+                batch = int(batch_size_ctl)
+                all_embs = []
+                total = len(imgs)
+                done = 0
+                from concurrent.futures import ThreadPoolExecutor
+                for i in range(0, total, batch):
+                    batch_paths = imgs[i:i+batch]
+                    # threaded load
+                    tensors = [None]*len(batch_paths)
+                    def _load(ix_p):
+                        ix, p = ix_p
+                        try:
+                            im = Image.open(p).convert("RGB")
+                        except Exception:
+                            im = Image.new("RGB", (224,224))
+                        tensors[ix] = preprocess_vit(im)
+                    with ThreadPoolExecutor(max_workers=int(io_workers_ctl)) as ex:
+                        list(ex.map(_load, enumerate(batch_paths)))
+                    # Load models per selected backbone
+                    vm, cm, pv, pc, vd, cd = load_models(model_choice)
+                    embs, _ = compute_batch_embeddings(tensors, [], vm, None)
+                    # normalize for IP
+                    embs = embs / (np.linalg.norm(embs, axis=1, keepdims=True) + 1e-10)
+                    all_embs.append(embs.astype(np.float32))
+                    done = min(total, i+batch)
+                    pct = int(done*100/total)
+                    pbar.progress(pct)
+                    status.text(f"Embeddings {pct}% ({done}/{total})")
 
-            # store for session
-            st.session_state.min_index = idx
-            st.session_state.min_paths = imgs
-            st.success(f"Indexed {len(imgs)} images (in memory). You can search below.")
+                embs_mat = np.vstack(all_embs)
+                if use_ivfpq:
+                    d = embs_mat.shape[1]
+                    nlist = int(nlist_ctl)
+                    pqm = int(pqm_ctl)
+                    quant = faiss.IndexFlatIP(d)
+                    ivfpq = faiss.IndexIVFPQ(quant, d, nlist, pqm, 8)
+                    # train on a subset
+                    train_n = min(embs_mat.shape[0], max(4096, nlist*4))
+                    ivfpq.train(embs_mat[:train_n])
+                    ivfpq.add(embs_mat)
+                    idx = ivfpq
+                else:
+                    idx = faiss.IndexFlatIP(embs_mat.shape[1])
+                    idx.add(embs_mat)
+
+                # store for session
+                st.session_state.min_index = idx
+                st.session_state.min_paths = imgs
+                st.success(f"Indexed {len(imgs)} images (in memory). You can search below.")
 
     st.markdown("---")
     st.subheader("Search (Minimal Mode)")
     upl = st.file_uploader("Upload an image to search", type=["jpg","jpeg","png","bmp","gif"], key="min_upl")
     if upl and st.session_state.get("min_index") is not None:
-        tmp_im = Image.open(upl).convert("RGB")
-        # Use same backbone as indexing
-        vm, cm, pv, pc, vd, cd = load_models(model_choice)
-        q = pv(tmp_im)
-        q_emb, _ = compute_batch_embeddings([q], [], vm, None)
-        qv = q_emb[0].astype(np.float32)
-        qv = qv / (np.linalg.norm(qv) + 1e-10)
-        D, I = st.session_state.min_index.search(np.array([qv], dtype=np.float32), 30)
-        cols = st.columns(5)
-        for i, idx_i in enumerate(I[0][:25]):
-            if idx_i < 0: continue
-            p = st.session_state.min_paths[idx_i]
+        if not HAS_EMBEDDINGS:
+            st.error("Embeddings module not available for search")
+        else:
             try:
-                with open(p, "rb") as f:
-                    b64 = base64.b64encode(f.read()).decode("utf-8")
-                mime = mimetypes.guess_type(p)[0] or "image/jpeg"
-                cols[i%5].markdown(f"<div class='img-card'><img src='data:{mime};base64,{b64}' /></div>", unsafe_allow_html=True)
-                cols[i%5].caption(Path(p).name)
-            except Exception:
-                cols[i%5].write(Path(p).name)
+                tmp_im = Image.open(upl).convert("RGB")
+                # Use same backbone as indexing
+                vm, cm, pv, pc, vd, cd = load_models(model_choice)
+                q = pv(tmp_im)
+                q_emb, _ = compute_batch_embeddings([q], [], vm, None)
+                qv = q_emb[0].astype(np.float32)
+                qv = qv / (np.linalg.norm(qv) + 1e-10)
+                D, I = st.session_state.min_index.search(np.array([qv], dtype=np.float32), 30)
+                cols = st.columns(5)
+                for i, idx_i in enumerate(I[0][:25]):
+                    if idx_i < 0: continue
+                    p = st.session_state.min_paths[idx_i]
+                    try:
+                        with open(p, "rb") as f:
+                            b64 = base64.b64encode(f.read()).decode("utf-8")
+                        mime = mimetypes.guess_type(p)[0] or "image/jpeg"
+                        cols[i%5].markdown(f"<div class='img-card'><img src='data:{mime};base64,{b64}' /></div>", unsafe_allow_html=True)
+                        cols[i%5].caption(Path(p).name)
+                    except Exception:
+                        cols[i%5].write(Path(p).name)
+            except Exception as e:
+                st.error(f"Error during search: {e}")
 
     # Stop rendering the rest of the complex UI in minimal mode
     st.stop()
@@ -396,6 +467,21 @@ if st.sidebar.button("Test Redis connection", key="test_redis_conn"):
         st.sidebar.success(f"Connected to Redis at {st.session_state.redis_host}:{st.session_state.redis_port}")
     except Exception as e:
         st.sidebar.error(f"Redis connection failed: {e}")
+
+# Module Status
+st.sidebar.markdown("### Module Status")
+st.sidebar.write(f"**Embeddings**: {'✅' if HAS_EMBEDDINGS else '❌'}")
+st.sidebar.write(f"**Utils**: {'✅' if HAS_UTILS else '❌'}")
+st.sidebar.write(f"**Ollama**: {'✅' if HAS_OLLAMA else '❌'}")
+st.sidebar.write(f"**FAISS**: {'✅' if faiss else '❌'}")
+st.sidebar.write(f"**PyTorch**: {'✅' if torch else '❌'}")
+st.sidebar.write(f"**Whoosh**: {'✅' if 'whoosh' in sys.modules else '❌'}")
+
+# Show warnings for missing critical modules
+if not HAS_EMBEDDINGS:
+    st.sidebar.warning("⚠️ Embeddings module missing - ML features disabled")
+if not HAS_UTILS:
+    st.sidebar.warning("⚠️ Utils module missing - Basic functions disabled")
 
 def _get_query_params_compat():
     try:
