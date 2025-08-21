@@ -18,17 +18,99 @@ from PIL import Image
 # Add app directory to sys.path to import modules
 sys.path.insert(0, os.path.abspath('./app'))
 
-# Import refactored functions or classes
-from app.hashers import get_hashers
-from app.distributed_engine import OptimizedRedisClient, WorkerStats
-from app.optimized_embeddings import OptimizedEmbeddingComputer, optimize_gpu_settings
-from app.embeddings import load_models, compute_batch_embeddings
-from app.utils import fingerprint, load_cache, save_cache, read_exif
-from app.llm_ollama import ollama_installed, generate_caption_ollama, model_available, general_ollama_query
+# Safe import function
+def safe_import(module_name, fallback=None):
+    """Safely import a module, returning fallback if import fails"""
+    try:
+        return __import__(module_name)
+    except Exception as e:
+        return fallback
+
+# Initialize module flags
+HAS_HASHERS = False
+HAS_DISTRIBUTED_ENGINE = False
+HAS_OPTIMIZED_EMBEDDINGS = False
+HAS_EMBEDDINGS = False
+HAS_UTILS = False
+HAS_OLLAMA = False
+
+# Initialize function references
+get_hashers = None
+OptimizedRedisClient = None
+WorkerStats = None
+OptimizedEmbeddingComputer = None
+optimize_gpu_settings = None
+load_models = None
+compute_batch_embeddings = None
+fingerprint = None
+load_cache = None
+save_cache = None
+read_exif = None
+ollama_installed = None
+generate_caption_ollama = None
+model_available = None
+general_ollama_query = None
 
 # Configure logging for Streamlit
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+def safe_import_modules():
+    """Safely import all modules and set flags"""
+    global HAS_HASHERS, HAS_DISTRIBUTED_ENGINE, HAS_OPTIMIZED_EMBEDDINGS
+    global HAS_EMBEDDINGS, HAS_UTILS, HAS_OLLAMA
+    global get_hashers, OptimizedRedisClient, WorkerStats, OptimizedEmbeddingComputer
+    global optimize_gpu_settings, load_models, compute_batch_embeddings
+    global fingerprint, load_cache, save_cache, read_exif
+    global ollama_installed, generate_caption_ollama, model_available, general_ollama_query
+    
+    # Try to import hashers
+    try:
+        from app.hashers import get_hashers
+        HAS_HASHERS = True
+        st.sidebar.success("✅ Hashers module loaded")
+    except ImportError as e:
+        st.sidebar.warning(f"❌ Hashers module: {e}")
+    
+    # Try to import distributed engine
+    try:
+        from app.distributed_engine import OptimizedRedisClient, WorkerStats
+        HAS_DISTRIBUTED_ENGINE = True
+        st.sidebar.success("✅ Distributed Engine module loaded")
+    except ImportError as e:
+        st.sidebar.warning(f"❌ Distributed Engine module: {e}")
+    
+    # Try to import optimized embeddings
+    try:
+        from app.optimized_embeddings import OptimizedEmbeddingComputer, optimize_gpu_settings
+        HAS_OPTIMIZED_EMBEDDINGS = True
+        st.sidebar.success("✅ Optimized Embeddings module loaded")
+    except ImportError as e:
+        st.sidebar.warning(f"❌ Optimized Embeddings module: {e}")
+    
+    # Try to import embeddings
+    try:
+        from app.embeddings import load_models, compute_batch_embeddings
+        HAS_EMBEDDINGS = True
+        st.sidebar.success("✅ Embeddings module loaded")
+    except ImportError as e:
+        st.sidebar.warning(f"❌ Embeddings module: {e}")
+    
+    # Try to import utils
+    try:
+        from app.utils import fingerprint, load_cache, save_cache, read_exif
+        HAS_UTILS = True
+        st.sidebar.success("✅ Utils module loaded")
+    except ImportError as e:
+        st.sidebar.warning(f"❌ Utils module: {e}")
+    
+    # Try to import Ollama
+    try:
+        from app.llm_ollama import ollama_installed, generate_caption_ollama, model_available, general_ollama_query
+        HAS_OLLAMA = True
+        st.sidebar.success("✅ Ollama module loaded")
+    except ImportError as e:
+        st.sidebar.warning(f"❌ Ollama module: {e}")
 
 # --- Configuration Loading ---
 @st.cache_data
@@ -52,6 +134,11 @@ if not config:
 
 def enqueue_jobs_programmatic(input_dir: str, config: dict):
     st.info(f"Scanning for images in {input_dir} and enqueuing jobs...")
+    
+    if not HAS_HASHERS:
+        st.error("Hashers module not available. Cannot process images.")
+        return 0
+        
     cfg_redis = config['redis']
     cfg_perf = config['performance']['enqueuer']
 
@@ -119,6 +206,11 @@ def enqueue_jobs_programmatic(input_dir: str, config: dict):
 
 def run_optimized_worker_once(config: dict):
     st.info("Starting optimized worker to process jobs from Redis...")
+    
+    if not HAS_OPTIMIZED_EMBEDDINGS:
+        st.error("Optimized embeddings module not available. Cannot process jobs.")
+        return
+        
     cfg_redis = config['redis']
     
     try:
@@ -310,6 +402,11 @@ def build_index_programmatic(config: dict, case_name: str = None):
 
 def run_captions_programmatic(image_paths: list, config: dict):
     st.info("Starting caption generation (Phase 2)...")
+    
+    if not HAS_OLLAMA:
+        st.warning("Ollama module not available. Skipping captioning.")
+        return
+        
     if not ollama_installed() or not model_available("llava"):
         st.warning("Ollama or llava model not available. Skipping captioning. Please ensure Ollama is running and 'llava' model is pulled.")
         return
@@ -330,12 +427,26 @@ def run_captions_programmatic(image_paths: list, config: dict):
 st.set_page_config(layout="wide", page_title="FORCEPS Lite")
 
 st.title("FORCEPS Lite Web App")
+st.info("This app is running in safe mode with graceful error handling for missing modules.")
+
+# Safely import modules after Streamlit is initialized
+with st.spinner("Loading modules safely..."):
+    safe_import_modules()
 
 st.sidebar.header("Configuration")
 input_dir_default = config['data']['input_dir']
 input_dir = st.sidebar.text_input("Image Directory for Indexing", value=input_dir_default)
 output_dir_default = config['data']['output_dir']
 output_dir = st.sidebar.text_input("Output Directory for Indexes", value=output_dir_default)
+
+st.sidebar.markdown("---")
+st.sidebar.header("Module Status")
+st.sidebar.write(f"**Hashers**: {'✅' if HAS_HASHERS else '❌'}")
+st.sidebar.write(f"**Distributed Engine**: {'✅' if HAS_DISTRIBUTED_ENGINE else '❌'}")
+st.sidebar.write(f"**Optimized Embeddings**: {'✅' if HAS_OPTIMIZED_EMBEDDINGS else '❌'}")
+st.sidebar.write(f"**Embeddings**: {'✅' if HAS_EMBEDDINGS else '❌'}")
+st.sidebar.write(f"**Utils**: {'✅' if HAS_UTILS else '❌'}")
+st.sidebar.write(f"**Ollama**: {'✅' if HAS_OLLAMA else '❌'}")
 
 st.sidebar.markdown("---")
 st.sidebar.header("Redis Status")
@@ -355,34 +466,46 @@ except Exception:
 st.header("1. Build Index and Captions")
 st.write("This process will scan your image directory, compute embeddings, build a searchable index, and generate captions using Ollama (if configured).")
 
+if not HAS_HASHERS or not HAS_OPTIMIZED_EMBEDDINGS:
+    st.warning("⚠️ Some required modules are not available. Full indexing functionality may be limited.")
+    st.info("Available modules will be used where possible.")
+
 if st.button("Start Indexing and Captioning"):
     if not os.path.isdir(input_dir):
         st.error(f"Input directory '{input_dir}' does not exist.")
+    elif not HAS_HASHERS:
+        st.error("Hashers module not available. Cannot process images.")
+    elif not HAS_OPTIMIZED_EMBEDDINGS:
+        st.error("Optimized embeddings module not available. Cannot process jobs.")
     else:
         st.session_state.indexing_case_dir = None
         with st.spinner("Starting indexing and captioning..."):
-            # Step 1: Enqueue Jobs
-            total_images_found = enqueue_jobs_programmatic(input_dir, config)
-            if total_images_found > 0:
-                # Step 2: Run Worker to process jobs
-                run_optimized_worker_once(config)
-                
-                # Step 3: Build Index
-                case_output_path = build_index_programmatic(config)
-                st.session_state.indexing_case_dir = case_output_path
-                
-                # Step 4: Generate Captions
-                if case_output_path:
-                    # Need to load image paths from the newly built index
-                    try:
-                        with open(case_output_path / "image_paths.pkl", "rb") as f:
-                            indexed_image_paths = pickle.load(f)
-                        run_captions_programmatic(indexed_image_paths, config)
-                    except Exception as e:
-                        st.error(f"Error loading indexed image paths for captioning: {e}")
-                st.success("Indexing and Captioning process completed!")
-            else:
-                st.warning("No images found or jobs enqueued. Indexing skipped.")
+            try:
+                # Step 1: Enqueue Jobs
+                total_images_found = enqueue_jobs_programmatic(input_dir, config)
+                if total_images_found > 0:
+                    # Step 2: Run Worker to process jobs
+                    run_optimized_worker_once(config)
+                    
+                    # Step 3: Build Index
+                    case_output_path = build_index_programmatic(config)
+                    st.session_state.indexing_case_dir = case_output_path
+                    
+                    # Step 4: Generate Captions
+                    if case_output_path and HAS_OLLAMA:
+                        # Need to load image paths from the newly built index
+                        try:
+                            with open(case_output_path / "image_paths.pkl", "rb") as f:
+                                indexed_image_paths = pickle.load(f)
+                            run_captions_programmatic(indexed_image_paths, config)
+                        except Exception as e:
+                            st.error(f"Error loading indexed image paths for captioning: {e}")
+                    st.success("Indexing and Captioning process completed!")
+                else:
+                    st.warning("No images found or jobs enqueued. Indexing skipped.")
+            except Exception as e:
+                st.error(f"Error during indexing: {e}")
+                st.info("Check the module status in the sidebar to see which components are available.")
 
 st.header("2. Search by Image")
 st.write("Upload an image to find similar images in your indexed collection.")
@@ -397,40 +520,43 @@ if uploaded_file is not None:
         st.write("")
         st.write("Searching...")
 
-        # Load models for query
-        vit_model, clip_model, preprocess_vit, preprocess_clip, vit_dim, clip_dim = load_models()
+        if not HAS_EMBEDDINGS:
+            st.error("Embeddings module not available. Cannot perform image search.")
+        else:
+            # Load models for query
+            vit_model, clip_model, preprocess_vit, preprocess_clip, vit_dim, clip_dim = load_models()
 
-        # Load index and image paths from the last built index
-        case_dir = st.session_state.indexing_case_dir
-        try:
-            index_path = case_dir / "image_index.faiss"
-            with open(case_dir / "image_paths.pkl", "rb") as f:
-                image_paths = pickle.load(f)
-            
-            index = faiss.read_index(str(index_path))
-            st.info(f"Loaded index with {index.ntotal} vectors.")
+            # Load index and image paths from the last built index
+            case_dir = st.session_state.indexing_case_dir
+            try:
+                index_path = case_dir / "image_index.faiss"
+                with open(case_dir / "image_paths.pkl", "rb") as f:
+                    image_paths = pickle.load(f)
+                
+                index = faiss.read_index(str(index_path))
+                st.info(f"Loaded index with {index.ntotal} vectors.")
 
-            # Preprocess and compute embedding for uploaded image
-            img = Image.open(uploaded_file).convert("RGB")
-            vit_tensor = preprocess_vit(img)
-            query_emb, _ = compute_batch_embeddings([vit_tensor], [], vit_model, None)
-            query_vector = query_emb[0].astype(np.float32)
-            query_vector = query_vector / (np.linalg.norm(query_vector) + 1e-10) # Normalize
+                # Preprocess and compute embedding for uploaded image
+                img = Image.open(uploaded_file).convert("RGB")
+                vit_tensor = preprocess_vit(img)
+                query_emb, _ = compute_batch_embeddings([vit_tensor], [], vit_model, None)
+                query_vector = query_emb[0].astype(np.float32)
+                query_vector = query_vector / (np.linalg.norm(query_vector) + 1e-10) # Normalize
 
-            # Perform search
-            distances, indices = index.search(np.array([query_vector]), 10) # Top 10 results
+                # Perform search
+                distances, indices = index.search(np.array([query_vector]), 10) # Top 10 results
 
-            st.subheader("Top 10 Similar Images:")
-            for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
-                if idx >= 0 and idx < len(image_paths):
-                    result_path = image_paths[idx]
-                    st.write(f"**{i+1}.** {Path(result_path).name} (Similarity: {dist:.3f})")
-                    st.image(result_path, width=100)
-                else:
-                    st.write(f"**{i+1}.** Invalid index: {idx}")
+                st.subheader("Top 10 Similar Images:")
+                for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
+                    if idx >= 0 and idx < len(image_paths):
+                        result_path = image_paths[idx]
+                        st.write(f"**{i+1}.** {Path(result_path).name} (Similarity: {dist:.3f})")
+                        st.image(result_path, width=100)
+                    else:
+                        st.write(f"**{i+1}.** Invalid index: {idx}")
 
-        except Exception as e:
-            st.error(f"Error during image search: {e}")
+            except Exception as e:
+                st.error(f"Error during image search: {e}")
 
 st.header("3. Query Captions or Ollama")
 st.write("Search through generated captions or query the Ollama LLM directly.")
@@ -453,34 +579,39 @@ if text_query:
                 # This is a simplified approach, a real Whoosh search would be better
                 st.info("Performing basic caption search. For large datasets, a dedicated text index is recommended.")
                 
-                # Re-load image_paths to iterate and check cache
-                with open(case_dir / "image_paths.pkl", "rb") as f:
-                    indexed_image_paths = pickle.load(f)
-                
-                found_results = []
-                for img_path in indexed_image_paths:
-                    fp = fingerprint(Path(img_path))
-                    cached_data = load_cache(fp)
-                    if cached_data and "metadata" in cached_data and "caption" in cached_data["metadata"]:
-                        caption = cached_data["metadata"]["caption"]
-                        if text_query.lower() in caption.lower():
-                            found_results.append({"path": img_path, "caption": caption})
-                
-                if found_results:
-                    st.subheader("Matching Captions:")
-                    for res in found_results:
-                        st.write(f"**Image:** {Path(res['path']).name}")
-                        st.write(f"**Caption:** {res['caption']}")
-                        st.image(res['path'], width=100)
+                if not HAS_UTILS:
+                    st.error("Utils module not available. Cannot search captions.")
                 else:
-                    st.info("No matching captions found.")
+                    # Re-load image_paths to iterate and check cache
+                    with open(case_dir / "image_paths.pkl", "rb") as f:
+                        indexed_image_paths = pickle.load(f)
+                    
+                    found_results = []
+                    for img_path in indexed_image_paths:
+                        fp = fingerprint(Path(img_path))
+                        cached_data = load_cache(fp)
+                        if cached_data and "metadata" in cached_data and "caption" in cached_data["metadata"]:
+                            caption = cached_data["metadata"]["caption"]
+                            if text_query.lower() in caption.lower():
+                                found_results.append({"path": img_path, "caption": caption})
+                    
+                    if found_results:
+                        st.subheader("Matching Captions:")
+                        for res in found_results:
+                            st.write(f"**Image:** {Path(res['path']).name}")
+                            st.write(f"**Caption:** {res['caption']}")
+                            st.image(res['path'], width=100)
+                    else:
+                        st.info("No matching captions found.")
 
             except Exception as e:
                 st.error(f"Error during caption search: {e}")
 
     elif query_type == "Ollama Query":
         st.write(f"Querying Ollama with: '{text_query}'")
-        if not ollama_installed():
+        if not HAS_OLLAMA:
+            st.error("Ollama module not available. Cannot query LLM.")
+        elif not ollama_installed():
             st.warning("Ollama is not installed or not in PATH. Cannot query LLM.")
         elif not model_available("llama2"): # Assuming llama2 is the model for general queries
             st.warning("Llama2 model not available. Please pull 'llama2' model for Ollama queries.")
@@ -492,3 +623,52 @@ if text_query:
                     st.write(response)
                 except Exception as e:
                     st.error(f"Error querying Ollama: {e}")
+
+st.header("4. Simple File Browser (Demo Mode)")
+st.write("Browse and view images from your input directory without requiring complex modules.")
+
+if os.path.isdir(input_dir):
+    st.subheader(f"Images in {input_dir}")
+    
+    # Simple file browser
+    image_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".webp"}
+    image_files = []
+    
+    for root, dirs, files in os.walk(input_dir):
+        for file in files:
+            if Path(file).suffix.lower() in image_extensions:
+                image_files.append(os.path.join(root, file))
+    
+    if image_files:
+        st.success(f"Found {len(image_files)} images")
+        
+        # Show first few images
+        if st.button("Show Sample Images"):
+            cols = st.columns(3)
+            for i, img_path in enumerate(image_files[:9]):  # Show first 9
+                col_idx = i % 3
+                with cols[col_idx]:
+                    try:
+                        st.image(img_path, caption=Path(img_path).name, width=150)
+                    except Exception as e:
+                        st.write(f"Error loading {Path(img_path).name}: {e}")
+    else:
+        st.info("No image files found in the input directory.")
+else:
+    st.warning(f"Input directory '{input_dir}' does not exist.")
+
+st.header("5. System Information")
+st.write("Current system status and capabilities.")
+
+col1, col2 = st.columns(2)
+with col1:
+    st.subheader("Python Environment")
+    st.write(f"**Python Version**: {sys.version}")
+    st.write(f"**Working Directory**: {os.getcwd()}")
+    
+with col2:
+    st.subheader("Available Libraries")
+    st.write(f"**FAISS**: {'Available' if faiss else 'Not Available'}")
+    st.write(f"**PyTorch**: {'Available' if torch else 'Not Available'}")
+    st.write(f"**PIL**: Available")
+    st.write(f"**Redis**: Available")

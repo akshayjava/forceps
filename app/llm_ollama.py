@@ -54,7 +54,7 @@ def generate_caption_ollama(image_path, model_name="llava"):
     except Exception:
         return None
 
-def general_ollama_query(query_text: str, model_name: str = "llama2") -> str | None:
+def general_ollama_query(query_text: str, model_name: str = "llama2") -> str:
     """
     Performs a general text query to an Ollama LLM.
     Assumes 'ollama' CLI is installed locally.
