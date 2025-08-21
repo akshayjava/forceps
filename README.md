@@ -109,112 +109,62 @@ sudo systemctl start redis-server
 redis-cli ping  # Should return PONG
 ```
 
-## Running FORCEPS from the Command Line
+## Command-Line End-to-End Workflow
+This section describes the recommended workflow for indexing and querying images entirely from the command line on a single machine. This is the simplest and fastest way to get started with FORCEPS.
 
-### 1. Configure Your Case
-Edit the configuration file to specify your input directory and other settings:
+### Step 1: Indexing Images (`run_cli.py`)
+The `run_cli.py` script is a standalone tool for quickly creating a searchable index from a directory of images. It computes image embeddings, builds a FAISS index, and saves metadata.
 
+**Usage:**
 ```bash
-# Standard configuration
-vim app/config.yaml
+# Ensure you are in the project's root directory
+# Make sure required packages are installed:
+# pip install torch torchvision transformers faiss-cpu pillow tqdm opencv-python
 
-# Or use the optimized configuration for better performance
-vim app/config_optimized.yaml
-```
-
-Key settings to update:
-- `data.input_dir`: Path to your forensic images directory
-- `data.output_dir`: Where to store the output (default: `./output_index`)
-- `case_details.case_name`: Name for your investigation case
-
-### 2. Run CLI Indexing (no UI)
-
-Quickly index a directory from the command line using the ViT indexer:
-
-```bash
-cd /path/to/foreceps
-python3 -m pip install --user --upgrade torch torchvision transformers faiss-cpu pillow tqdm opencv-python
 PYTHONPATH=. python3 run_cli.py \
-  --image_dir /path/to/images \
-  --output_dir index_out_opt \
-  --device auto --batch_size 16 \
-  --captions  # optional; requires ollama + llava
+  --image_dir "/path/to/your/images" \
+  --output_dir "index_output" \
+  --device auto \
+  --batch_size 16
 ```
 
-By default, FP16/compile are disabled on CPU/MPS for stability and enabled (FP16 only) on CUDA. Use `--fp16/--no-fp16` and `--compile/--no-compile` to override.
-
-Indexes written to `output_dir`:
-- `image_index.faiss`: FAISS vector index
-- `image_paths.pkl`: list of image paths
-- `metadata.pkl`: index metadata
-- `exif.json`: EXIF fields for filtering (make/model/datetime)
-- `captions.tsv` (optional): image path + tab + caption
-
-### 3. Start the Web Application (UI)
-
-The Streamlit web interface provides control over the entire system:
-
+**Optional: Generate Text Captions**
+If you have `ollama` installed with the `llava` model, you can automatically generate descriptive captions for each image. This is required for text-based search.
 ```bash
-# Ensure PYTHONPATH includes the project root
-PYTHONPATH=/path/to/foreceps streamlit run app/main.py --server.port 8501 --server.address localhost
+# Add the --captions flag to the command above
+PYTHONPATH=. python3 run_cli.py \
+  --image_dir "/path/to/your/images" \
+  --output_dir "index_output" \
+  --captions
 ```
 
-This will launch the web application at http://localhost:8501
+This command will create the `index_output` directory (or the name you specified) containing the following files:
+- `image_index.faiss`: The FAISS vector index for similarity search.
+- `image_paths.pkl`: A list of the indexed image paths.
+- `metadata.pkl`: Index metadata.
+- `exif.json`: EXIF data extracted from images, useful for filtering.
+- `captions.tsv` (if `--captions` is used): A tab-separated file of image paths and their text descriptions.
 
-The UI supports:
-- Search by image (nearest neighbors from `image_index.faiss`)
-- Search by text (if CLIP text index is available; otherwise use captions.tsv via a simple grep-like interface)
-- Filtering by EXIF (uses `exif.json`)
+For performance tuning options (e.g., using a GPU), see the *Optimizing the Command-Line Indexer* section in `OPTIMIZATION_GUIDE.md`.
 
-### 4. Start Background Processing Workers
+### Step 2: Querying by Image
+Once the index is built, you can find the top 10 most visually similar images to a query image using the following command.
 
-For optimal performance, start multiple worker processes to process images in parallel:
-
-```bash
-# Start multiple optimized workers (in separate terminals)
-PYTHONPATH=/path/to/foreceps python app/optimized_worker.py --config app/config_optimized.yaml
-PYTHONPATH=/path/to/foreceps python app/optimized_worker.py --config app/config_optimized.yaml
-PYTHONPATH=/path/to/foreceps python app/optimized_worker.py --config app/config_optimized.yaml
-
-# Optionally run the auto-scaling worker manager
-PYTHONPATH=/path/to/foreceps python app/auto_scale_workers.py --config app/config_optimized.yaml
-```
-
-### 5. Process a Directory of Images
-
-Queue a directory of images for processing with the enqueuer script:
-
-```bash
-# Process a specific directory
-PYTHONPATH=/path/to/foreceps python app/enqueue_jobs.py --config app/config_optimized.yaml --input_dir /path/to/evidence --job_batch_size 256
-
-# Use the directory specified in the config file
-PYTHONPATH=/path/to/foreceps python app/enqueue_jobs.py --config app/config_optimized.yaml
-```
-
-### 6. Monitor Processing Progress
-
-Check the current processing status:
-
-```bash
-# View queue statistics
-redis-cli mget "forceps:stats:total_images" "forceps:stats:embeddings_done" "forceps:stats:captions_done"
-
-# View remaining jobs in queue
-redis-cli llen forceps:job_queue
-```
-
-### 7. Command-line Query Tools
-
-Image query (top-10):
+**Usage:**
+Replace `index_output` with your output directory and `/path/to/query.jpg` with the path to your query image.
 ```bash
 python3 - <<'PY'
 import sys, pickle, numpy as np, torch
 from transformers import ViTImageProcessor, ViTModel
 from PIL import Image
 import faiss, os
-outdir = "index_out_opt"
-query_img = sys.argv[1]
+# --- Configuration ---
+outdir = "index_output"  # <-- Set your output directory here
+query_img = sys.argv[1]   # <-- Query image path is passed as an argument
+# --- Script ---
+if not os.path.isdir(outdir) or not os.path.isfile(query_img):
+    print(f"Error: Ensure output directory '{outdir}' exists and query image '{query_img}' is valid.")
+    sys.exit(1)
 paths = pickle.load(open(os.path.join(outdir,"image_paths.pkl"),"rb"))
 index = faiss.read_index(os.path.join(outdir,"image_index.faiss"))
 proc = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224-in21k")
@@ -225,54 +175,64 @@ with torch.no_grad():
     feat = model(**inp).last_hidden_state[:,0].cpu().float().numpy()
 feat /= (np.linalg.norm(feat,axis=1,keepdims=True)+1e-8)
 D,I = index.search(feat.astype("float32"), 10)
+print(f"Top 10 most similar images to '{query_img}':")
 for r,(d,idx) in enumerate(zip(D[0],I[0]),1):
     if idx==-1: continue
     print(f"{r:02d}\t{paths[idx]}")
 PY "/path/to/query.jpg"
 ```
 
-Text query via caption file:
+### Step 3: Querying by Text
+If you generated captions during indexing (Step 1), you can perform a text-based search using `grep`. This command searches the `captions.tsv` file for a specific phrase and returns the paths of the matching images.
+
+**Usage:**
+Replace `index_output` with your output directory and `"your phrase here"` with your search query.
 ```bash
-grep -i "your phrase here" index_out_opt/captions.tsv | cut -f1 | head -n 10
+grep -i "your phrase here" index_output/captions.tsv | cut -f1 | head -n 10
 ```
 
-### 8. Running the Complete Pipeline
+## Using the Web Application (for Distributed Processing)
 
-Here's a complete sequence to run FORCEPS from scratch:
-
-```bash
-# Terminal 1: Start Redis (if not already running)
-redis-server
-
-# Terminal 2: Start the web interface
-PYTHONPATH=/path/to/foreceps streamlit run app/main.py
-
-# Terminal 3: Start worker processes
-PYTHONPATH=/path/to/foreceps python app/optimized_worker.py --config app/config_optimized.yaml
-
-# Terminal 4: Enqueue images for processing
-PYTHONPATH=/path/to/foreceps python app/enqueue_jobs.py --config app/config_optimized.yaml --input_dir /path/to/evidence
-```
-
-## Using the Application
+This section describes the original, more advanced workflow that uses a web interface to manage a distributed processing backend. This is suitable for processing massive datasets across multiple machines.
 
 ### 1. Configure Your Case
-Before starting, edit `app/config.yaml` (or `app/config.docker.yaml` if using Docker) to set your `case_name` and `input_dir`.
+Edit the configuration file (`app/config.yaml` or `app/config_optimized.yaml`) to specify your input directory, case name, and Redis connection details.
 
-### 2. Start the Backend
-If running manually, start the `worker` and `indexer` scripts in separate terminals as shown in the command line instructions above. If using Docker, `docker-compose up` handles this for you.
+### 2. Start the Backend Infrastructure
+This workflow requires a Redis server to be running.
+```bash
+# Start Redis (if not already running)
+redis-server
+```
 
-### 3. Start the Indexing Job
-Run the `enqueuer` script manually as shown above, or click the "Start Indexing Job" button in the UI. This will begin populating the Redis queue. You can monitor the progress in the UI's "Backend Monitoring" section.
+### 3. Start the Web UI and Workers
+You will need multiple terminals.
 
-### 4. Analyze the Results
-Once processing is underway, you can immediately start using the UI (`http://localhost:8501`):
-1.  **Load the Case:** In the sidebar, select your case from the dropdown and click "Load Selected Case".
-2.  **Search:** Use the search bar to perform a hybrid keyword and semantic search.
-3.  **Inspect:** Click "Show Details" on any image to see its full path, all computed hashes, and EXIF metadata.
-4.  **Cluster:** Use the "Cluster Analysis" section to group results visually and find patterns.
-5.  **Bookmark:** Use the "Manage Bookmark" expander to save items of interest, add tags, and write detailed notes.
-6.  **Report:** Go to the "Reporting" tab to review all bookmarked items and generate a comprehensive PDF report for your case file.
+**Terminal 1: Start the Web Application**
+```bash
+# Ensure PYTHONPATH includes the project root
+PYTHONPATH=. streamlit run app/main.py
+```
+This launches the UI at `http://localhost:8501`.
+
+**Terminal 2 (and others): Start Background Workers**
+For optimal performance, start multiple worker processes to process images in parallel.
+```bash
+PYTHONPATH=. python app/optimized_worker.py --config app/config_optimized.yaml
+```
+
+### 4. Enqueue Images for Processing
+Use the `enqueue_jobs.py` script to scan a directory and add jobs to the Redis queue for the workers to process.
+```bash
+PYTHONPATH=. python app/enqueue_jobs.py --config app/config_optimized.yaml --input_dir /path/to/evidence
+```
+
+### 5. Monitor and Analyze in the UI
+Use the web interface to:
+- Monitor the progress of the indexing job.
+- Load the completed case for analysis.
+- Search, filter, cluster, and bookmark results.
+- Generate reports.
 
 ## Performance Optimization Tips
 
