@@ -17,23 +17,23 @@ models:
 
 performance:
   worker:
-    batch_size: 16
-    max_workers: 4
+    batch_size: 32
+    max_workers: 8
   enqueuer:
-    job_batch_size: 256
-    scan_max_workers: 8
+    job_batch_size: 512
+    scan_max_workers: 16
   faiss:
-    use_pca: false
+    use_pca: true
     pca_dim: 384
-    ivf_nlist: 4096
-    pq_m: 64
-    train_samples: 5000
-    add_batch: 8192
+    ivf_nlist: 64
+    pq_m: 32
+    train_samples: 1000
+    add_batch: 100
 
 hashing:
   - "sha256"
   - "perceptual"
 
 features:
-  enable_captions: true
+  enable_captions: false  # Disabled to reduce cost and complexity
 

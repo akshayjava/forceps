@@ -15,6 +15,10 @@ import torch
 from PIL import Image
 import subprocess
 import uuid # For unique worker ID
+import urllib.request
+import zipfile
+import tempfile
+import shutil
 
 # Configure logging for the script
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -29,8 +33,7 @@ from app.distributed_engine import OptimizedRedisClient, WorkerStats
 from app.optimized_embeddings import OptimizedEmbeddingComputer, optimize_gpu_settings
 from app.embeddings import load_models, compute_batch_embeddings
 from app.utils import fingerprint, load_cache, save_cache, read_exif
-from app.llm_ollama import ollama_installed, generate_caption_ollama, model_available
-from app.engine import phase2_caption # Import phase2_caption directly
+# Removed caption generation imports to reduce cost and complexity
 
 # --- Configuration Loading ---
 def load_config(config_path="app/config.yaml"):
@@ -168,18 +171,31 @@ def build_index_programmatic_test(config: dict, case_name: str = None):
         pca_ret = pca_mat
         d_final = eff_pca_dim
 
-    nlist = min(faiss_args.ivf_nlist, n // 100) if n > 100 else 1
-    nlist = max(nlist, 1)
-    pq_m = faiss_args.pq_m
-    quantizer = faiss.IndexFlatL2(d_final)
-    cpu_index = faiss.IndexIVFPQ(quantizer, d_final, nlist, pq_m, 8)
-
-    index_to_train = faiss.index_cpu_to_gpu(gpu_res, 0, cpu_index) if use_gpu else cpu_index
-    train_data = pca_ret.apply_py(combined_embs[:faiss_args.train_samples]) if faiss_args.use_pca else combined_embs[:faiss_args.train_samples]
-    if len(train_data) > 0:
-        index_to_train.train(train_data)
+    # For large datasets, use optimized IVF index with PCA
+    if n < 100:
+        logger.info(f"Small dataset ({n} images), using simple flat index")
+        index_to_train = faiss.IndexFlatL2(d_final)
+        if use_gpu:
+            index_to_train = faiss.index_cpu_to_gpu(gpu_res, 0, index_to_train)
     else:
-        logger.warning("Not enough data to train FAISS index.")
+        # Use optimized parameters for larger datasets
+        nlist = min(faiss_args.ivf_nlist, max(1, n // 100))
+        pq_m = min(faiss_args.pq_m, d_final // 4)  # Ensure pq_m doesn't exceed dimension
+        
+        logger.info(f"Large dataset ({n} images), using IVF index with nlist={nlist}, pq_m={pq_m}")
+        quantizer = faiss.IndexFlatL2(d_final)
+        cpu_index = faiss.IndexIVFPQ(quantizer, d_final, nlist, pq_m, 8)
+        index_to_train = faiss.index_cpu_to_gpu(gpu_res, 0, cpu_index) if use_gpu else cpu_index
+        
+        # Use more training samples for better index quality
+        train_samples = min(faiss_args.train_samples, n)
+        train_data = pca_ret.apply_py(combined_embs[:train_samples]) if faiss_args.use_pca else combined_embs[:train_samples]
+        
+        if len(train_data) > 0:
+            logger.info(f"Training FAISS index with {len(train_data)} samples...")
+            index_to_train.train(train_data)
+        else:
+            logger.warning("Not enough data to train FAISS index.")
 
     add_batch_size = faiss_args.add_batch
     for off in range(0, n, add_batch_size):
@@ -194,18 +210,35 @@ def build_index_programmatic_test(config: dict, case_name: str = None):
     index_clip = None
     if has_clip and clip_embs is not None:
         _, d_clip = clip_embs.shape
-        clip_quantizer = faiss.IndexFlatL2(d_clip)
-        clip_cpu_index = faiss.IndexIVFPQ(clip_quantizer, d_clip, nlist, pq_m, 8)
-        clip_index_to_train = faiss.index_cpu_to_gpu(gpu_res, 0, clip_cpu_index) if use_gpu else clip_cpu_index
-        if len(clip_embs[:faiss_args.train_samples]) > 0:
-            clip_index_to_train.train(clip_embs[:faiss_args.train_samples])
+        if n < 100:
+            logger.info(f"Small dataset ({n} images), using simple flat index for CLIP")
+            clip_index_to_train = faiss.IndexFlatL2(d_clip)
+            if use_gpu:
+                clip_index_to_train = faiss.index_cpu_to_gpu(gpu_res, 0, clip_index_to_train)
         else:
-            logger.warning("Not enough data to train CLIP FAISS index.")
+            # Use optimized parameters for larger CLIP datasets
+            clip_nlist = min(faiss_args.ivf_nlist, max(1, n // 100))
+            clip_pq_m = min(faiss_args.pq_m, d_clip // 4)
+            
+            logger.info(f"Large CLIP dataset ({n} images), using IVF index with nlist={clip_nlist}, pq_m={clip_pq_m}")
+            clip_quantizer = faiss.IndexFlatL2(d_clip)
+            clip_cpu_index = faiss.IndexIVFPQ(clip_quantizer, d_clip, clip_nlist, clip_pq_m, 8)
+            clip_index_to_train = faiss.index_cpu_to_gpu(gpu_res, 0, clip_cpu_index) if use_gpu else clip_cpu_index
+            
+            # Use more training samples for better CLIP index quality
+            clip_train_samples = min(faiss_args.train_samples, n)
+            if len(clip_embs[:clip_train_samples]) > 0:
+                logger.info(f"Training CLIP FAISS index with {clip_train_samples} samples...")
+                clip_index_to_train.train(clip_embs[:clip_train_samples])
+            else:
+                logger.warning("Not enough data to train CLIP FAISS index.")
+        
         for off in range(0, n, add_batch_size):
             end = off + add_batch_size
             clip_index_to_train.add(clip_embs[off:end])
         index_clip = faiss.index_gpu_to_cpu(clip_index_to_train) if use_gpu else clip_index_to_train
-        index_clip.nprobe = min(64, max(1, nlist // 16))
+        if n >= 100:  # Only set nprobe for IVF indexes
+            index_clip.nprobe = min(64, max(1, nlist // 16))
 
     logger.info("Vector index building complete.")
 
@@ -214,8 +247,27 @@ def build_index_programmatic_test(config: dict, case_name: str = None):
     if index_clip:
         faiss.write_index(index_clip, str(case_output_dir / "clip.index"))
     if pca_ret:
-        with open(case_output_dir / "pca.matrix.pkl", "wb") as f:
-            pickle.dump(pca_ret, f)
+        try:
+            # Save PCA matrix using FAISS's built-in save method instead of pickle
+            pca_path = case_output_dir / "pca.matrix.faiss"
+            faiss.write_index(pca_ret, str(pca_path))
+            logger.info(f"Saved PCA matrix to {pca_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save PCA matrix: {e}")
+            # Fallback: try to save just the transformation matrix
+            try:
+                pca_data = {
+                    'd_in': pca_ret.d_in,
+                    'd_out': pca_ret.d_out,
+                    'is_trained': pca_ret.is_trained,
+                    'eigenvalues': pca_ret.eigenvalues,
+                    'PC': pca_ret.PC
+                }
+                with open(case_output_dir / "pca.matrix.pkl", "wb") as f:
+                    pickle.dump(pca_data, f)
+                logger.info("Saved PCA matrix data as fallback")
+            except Exception as e2:
+                logger.warning(f"Failed to save PCA matrix data: {e2}")
     
     image_paths_only = [item['path'] for item in manifest_data]
     with open(case_output_dir / "image_paths.pkl", "wb") as f:
@@ -231,20 +283,239 @@ def build_index_programmatic_test(config: dict, case_name: str = None):
     logger.info(f"Index building complete for case '{case_name}'. Saved to {case_output_dir}")
     return case_output_dir, image_paths_only
 
-def run_captions_programmatic_test(image_paths: list, config: dict):
-    logger.info("Starting caption generation (Phase 2)...")
-    if not ollama_installed() or not model_available("llava"):
-        logger.warning("Ollama or llava model not available. Skipping captioning. Please ensure Ollama is running and 'llava' model is pulled.")
-        return
+# Caption generation removed to reduce cost and complexity
 
-    max_workers = config["performance"]["worker"]["max_workers"]
+# --- Dataset Download Functions ---
+def download_benchmark_dataset(target_dir="./demo_images", min_images=50):
+    """Download a benchmark dataset for image similarity testing."""
+    logger.info(f"Checking if benchmark dataset is needed in {target_dir}")
     
-    class Args:
-        def __init__(self, mw: int):
-            self.max_workers = mw
+    # Check if we already have enough diverse images
+    image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}
+    existing_images = []
     
-    phase2_caption(image_paths, Args(max_workers))
-    logger.info("Caption generation complete.")
+    if os.path.exists(target_dir):
+        for root, _, files in os.walk(target_dir):
+            for filename in files:
+                if Path(filename).suffix.lower() in image_extensions:
+                    existing_images.append(os.path.join(root, filename))
+    
+    if len(existing_images) >= min_images:
+        logger.info(f"Already have {len(existing_images)} images, no need to download dataset")
+        return target_dir
+    
+    logger.info(f"Only {len(existing_images)} images found, downloading benchmark dataset...")
+    
+    # Create target directory if it doesn't exist
+    os.makedirs(target_dir, exist_ok=True)
+    
+    # Try to download from a public dataset first
+    if not download_public_dataset(target_dir, min_images):
+        # Fallback to synthetic images if download fails
+        logger.info("Public dataset download failed, creating synthetic images...")
+        create_synthetic_images(target_dir, min_images)
+    
+    # Also try to copy existing images from the project if available
+    copy_existing_project_images(target_dir)
+    
+    return target_dir
+
+def download_public_dataset(target_dir, min_images):
+    """Download a comprehensive image dataset for benchmarking."""
+    try:
+        logger.info("Attempting to download a comprehensive image dataset...")
+        
+        # Try to download a smaller, manageable dataset first
+        # Using smaller datasets that are good for testing
+        dataset_urls = [
+            # CIFAR-10 dataset (smaller, good for testing)
+            "https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz",
+            # Oxford 102 Flower Dataset (smaller, diverse)
+            "https://www.robots.ox.ac.uk/~vgg/data/flowers/102/102flowers.tgz",
+            # Caltech 101 dataset (smaller, diverse)
+            "http://www.vision.caltech.edu/Image_Datasets/Caltech101/101_ObjectCategories.tar.gz",
+            # MNIST dataset (very small, good for testing)
+            "https://storage.googleapis.com/learning-datasets/mnist/train-images-idx3-ubyte.gz"
+        ]
+        
+        for dataset_url in dataset_urls:
+            try:
+                logger.info(f"Trying to download dataset from: {dataset_url}")
+                
+                # Extract dataset name from URL
+                dataset_name = dataset_url.split('/')[-1].split('.')[0]
+                archive_path = os.path.join(target_dir, f"{dataset_name}.archive")
+                
+                # Download the archive
+                logger.info(f"Downloading {dataset_name}...")
+                urllib.request.urlretrieve(dataset_url, archive_path)
+                
+                # Extract the archive
+                logger.info(f"Extracting {dataset_name}...")
+                if archive_path.endswith('.tar.gz') or archive_path.endswith('.tgz'):
+                    import tarfile
+                    with tarfile.open(archive_path, 'r:gz') as tar:
+                        tar.extractall(target_dir)
+                elif archive_path.endswith('.zip'):
+                    with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+                        zip_ref.extractall(target_dir)
+                
+                # Clean up the archive
+                os.remove(archive_path)
+                
+                # Count extracted images
+                image_count = count_images_in_directory(target_dir)
+                logger.info(f"Successfully extracted {image_count} images from {dataset_name}")
+                
+                if image_count >= min_images:
+                    return True
+                    
+            except Exception as e:
+                logger.warning(f"Failed to download {dataset_url}: {e}")
+                continue
+        
+        # If all downloads fail, create synthetic images
+        logger.warning("All dataset downloads failed, will create synthetic images")
+        return False
+        
+    except Exception as e:
+        logger.warning(f"Failed to download any dataset: {e}")
+        return False
+
+def count_images_in_directory(directory):
+    """Count the number of image files in a directory and subdirectories."""
+    image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}
+    count = 0
+    
+    for root, _, files in os.walk(directory):
+        for filename in files:
+            if Path(filename).suffix.lower() in image_extensions:
+                count += 1
+    
+    return count
+
+def create_synthetic_images(target_dir, count):
+    """Create synthetic test images for additional variety."""
+    if count <= 0:
+        return
+    
+    logger.info(f"Creating {count} synthetic test images...")
+    
+    # Create simple synthetic images using PIL
+    for i in range(count):
+        try:
+            # Create images with different patterns and complexity
+            img_size = 256
+            img = Image.new('RGB', (img_size, img_size), color=(0, 0, 0))
+            
+            from PIL import ImageDraw
+            draw = ImageDraw.Draw(img)
+            
+            # Create different types of synthetic images
+            pattern_type = i % 5
+            
+            if pattern_type == 0:
+                # Geometric patterns
+                for j in range(5):
+                    x1 = (i * 20 + j * 40) % img_size
+                    y1 = (i * 15 + j * 30) % img_size
+                    x2 = (x1 + 60) % img_size
+                    y2 = (y1 + 60) % img_size
+                    color = ((i * 30 + j * 50) % 255, (i * 40 + j * 60) % 255, (i * 50 + j * 70) % 255)
+                    draw.rectangle([x1, y1, x2, y2], fill=color)
+                    
+            elif pattern_type == 1:
+                # Circular patterns
+                for j in range(8):
+                    x = (i * 25 + j * 30) % img_size
+                    y = (i * 20 + j * 25) % img_size
+                    radius = 15 + (i * 3 + j * 5) % 25
+                    color = ((i * 25 + j * 30) % 255, (i * 35 + j * 40) % 255, (i * 45 + j * 50) % 255)
+                    draw.ellipse([x-radius, y-radius, x+radius, y+radius], fill=color)
+                    
+            elif pattern_type == 2:
+                # Line patterns
+                for j in range(10):
+                    x1 = (i * 15 + j * 25) % img_size
+                    y1 = (i * 10 + j * 20) % img_size
+                    x2 = (x1 + 80) % img_size
+                    y2 = (y1 + 80) % img_size
+                    color = ((i * 20 + j * 25) % 255, (i * 30 + j * 35) % 255, (i * 40 + j * 45) % 255)
+                    draw.line([x1, y1, x2, y2], fill=color, width=3)
+                    
+            elif pattern_type == 3:
+                # Checkerboard pattern
+                square_size = 16
+                for x in range(0, img_size, square_size):
+                    for y in range(0, img_size, square_size):
+                        if ((x // square_size) + (y // square_size) + i) % 2 == 0:
+                            color = ((i * 20 + x) % 255, (i * 30 + y) % 255, (i * 40) % 255)
+                            draw.rectangle([x, y, x + square_size, y + square_size], fill=color)
+                            
+            else:
+                # Gradient pattern
+                for x in range(img_size):
+                    for y in range(img_size):
+                        r = int((x / img_size) * 255)
+                        g = int((y / img_size) * 255)
+                        b = int(((x + y) / (2 * img_size)) * 255)
+                        color = ((r + i * 10) % 255, (g + i * 15) % 255, (b + i * 20) % 255)
+                        draw.point([x, y], fill=color)
+            
+            # Save the image
+            filename = f"synthetic_{i:03d}.png"
+            filepath = os.path.join(target_dir, filename)
+            img.save(filepath)
+            
+        except Exception as e:
+            logger.warning(f"Failed to create synthetic image {i}: {e}")
+            continue
+
+def copy_existing_project_images(target_dir):
+    """Copy existing images from the project directory for additional variety."""
+    try:
+        # Look for images in common project directories
+        project_image_dirs = [
+            "venv_forceps/images",
+            "venv_forceps/lib/python3.9/site-packages/streamlit/static",
+            "venv_forceps/lib/python3.9/site-packages/streamlit/static/static/media",
+            "demo_images"  # Don't copy from self
+        ]
+        
+        copied_count = 0
+        for source_dir in project_image_dirs:
+            if os.path.exists(source_dir) and source_dir != target_dir:
+                logger.info(f"Looking for images in {source_dir}")
+                
+                for root, _, files in os.walk(source_dir):
+                    for filename in files:
+                        if Path(filename).suffix.lower() in {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}:
+                            source_path = os.path.join(root, filename)
+                            target_filename = f"project_{copied_count:03d}_{filename}"
+                            target_path = os.path.join(target_dir, target_filename)
+                            
+                            if not os.path.exists(target_path):
+                                try:
+                                    shutil.copy2(source_path, target_path)
+                                    copied_count += 1
+                                    logger.info(f"Copied {filename} to {target_filename}")
+                                    
+                                    if copied_count >= 20:  # Limit the number of copied images
+                                        break
+                                except Exception as e:
+                                    logger.warning(f"Failed to copy {filename}: {e}")
+                    
+                    if copied_count >= 20:
+                        break
+                        
+                if copied_count >= 20:
+                    break
+        
+        if copied_count > 0:
+            logger.info(f"Copied {copied_count} existing project images")
+        
+    except Exception as e:
+        logger.warning(f"Failed to copy existing project images: {e}")
 
 # --- Main Load Test Logic ---
 def main():
@@ -252,7 +523,9 @@ def main():
     if not config:
         sys.exit(1)
 
-    input_dir = "/Users/akshayjava/Downloads/Celebrity Faces Dataset"
+    # Ensure we have a good benchmark dataset
+    input_dir = download_benchmark_dataset("./demo_images", min_images=500)  # Increased to 500 images for large dataset testing
+    
     if not os.path.isdir(input_dir):
         logger.error(f"Input directory '{input_dir}' does not exist. Please provide a valid path.")
         sys.exit(1)
@@ -303,22 +576,38 @@ def main():
             "--worker_id", worker_id,
             "--config", "app/config.yaml" # Pass the config path
         ]
+        # Set PYTHONPATH for the subprocess
+        worker_env = os.environ.copy()
+        if 'PYTHONPATH' in worker_env:
+            worker_env['PYTHONPATH'] = os.path.abspath('.') + os.pathsep + worker_env['PYTHONPATH']
+        else:
+            worker_env['PYTHONPATH'] = os.path.abspath('.')
+
         # Start the worker as a subprocess
-        worker_process = subprocess.Popen(worker_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        worker_process = subprocess.Popen(worker_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=os.getcwd(), env=worker_env)
         logger.info(f"Worker process started with PID: {worker_process.pid}")
 
         # Monitor Redis for completion
-        initial_jobs_in_queue = r.llen(cfg_redis['job_queue'])
         total_embeddings_expected = int(r.get("forceps:stats:total_images") or 0)
         
         if total_embeddings_expected == 0:
             logger.warning("No embeddings expected. Worker might not have jobs to process.")
 
+        # Progress tracking for large datasets
+        last_progress_time = time.time()
+        progress_interval = 10 if total_embeddings_expected > 100 else 5  # More frequent updates for large datasets
+
         while True:
             embeddings_done = int(r.get("forceps:stats:embeddings_done") or 0)
             jobs_remaining = r.llen(cfg_redis['job_queue'])
-            logger.info(f"Embeddings done: {embeddings_done}/{total_embeddings_expected}, Jobs remaining: {jobs_remaining}")
             
+            current_time = time.time()
+            if current_time - last_progress_time >= progress_interval:
+                progress_percent = (embeddings_done / total_embeddings_expected * 100) if total_embeddings_expected > 0 else 0
+                logger.info(f"Progress: {embeddings_done}/{total_embeddings_expected} ({progress_percent:.1f}%) - Jobs remaining: {jobs_remaining}")
+                last_progress_time = current_time
+            
+            # Check for completion: all embeddings processed AND job queue is empty
             if embeddings_done >= total_embeddings_expected and jobs_remaining == 0:
                 logger.info("All embeddings processed and jobs queue is empty. Terminating worker.")
                 break
@@ -331,7 +620,7 @@ def main():
                 logger.error(f"Worker stderr:\n{stderr}")
                 break # Exit loop if worker crashed
 
-            time.sleep(5) # Poll every 5 seconds
+            time.sleep(2) # Poll more frequently for large datasets
 
     finally:
         if worker_process and worker_process.poll() is None:
@@ -360,20 +649,11 @@ def main():
     if case_output_path and len(indexed_image_paths) > 0 and time_build_index > 0:
         logger.info(f"Index building throughput: {len(indexed_image_paths) / time_build_index:.2f} images/second.")
 
-    # Phase 4: Caption Generation
-    if indexed_image_paths:
-        start_time = time.time()
-        run_captions_programmatic_test(indexed_image_paths, config)
-        end_time = time.time()
-        time_captions = end_time - start_time
-        logger.info(f"Phase 4 (Caption Generation) completed in {time_captions:.2f} seconds.")
-        if time_captions > 0:
-            logger.info(f"Captioning throughput: {len(indexed_image_paths) / time_captions:.2f} images/second.")
-    else:
-        logger.warning("No indexed images found for captioning. Skipping Phase 4.")
+    # Phase 4: Caption Generation - REMOVED to reduce cost and complexity
+    logger.info("Caption generation phase skipped to reduce cost and complexity.")
 
     logger.info("\n--- Load Test Summary ---")
-    total_time = time_enqueue + time_worker + time_build_index + (time_captions if indexed_image_paths else 0)
+    total_time = time_enqueue + time_worker + time_build_index
     logger.info(f"Total images processed: {total_images_found}")
     logger.info(f"Total time for all phases: {total_time:.2f} seconds.")
     if total_time > 0:
