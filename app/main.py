@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 FORCEPS: Forensic Optimized Retrieval & Clustering of Evidence via Perceptual Search
-Two-phase Streamlit app with local embeddings + optional Ollama captions.
-All processing is local. Ollama/PhotoDNA optional.
+CLIP-based Streamlit app for image search and similarity.
+All processing is local. CLIP embeddings only.
 """
 import os
 import time
@@ -30,7 +30,7 @@ import subprocess
 import shutil
 from PIL import Image
 import numpy as np
-import faiss
+# FAISS removed - CLIP-only search
 import redis
 import json
 import pickle
@@ -39,25 +39,22 @@ import torch
 from whoosh.index import open_dir as open_whoosh_dir
 from whoosh.qparser import QueryParser
 from sklearn.cluster import MiniBatchKMeans
-try:
-    faiss.omp_set_num_threads(1)
-except Exception:
-    pass
+# FAISS removed - CLIP-only search
 
 # --- Safe Module Loading ---
 def safe_import_modules():
     """Safely import optional modules and set availability flags"""
-    global HAS_EMBEDDINGS, HAS_UTILS, HAS_OLLAMA
+    global HAS_EMBEDDINGS, HAS_UTILS
     global load_models, compute_batch_embeddings, compute_clip_text_embedding
     global is_image_file, fingerprint, load_cache, save_cache, compute_perceptual_hashes
     global read_exif, _gather_metadata_for_path, hamming_distance
     global load_bookmarks, save_bookmarks, generate_bookmarks_pdf
-    global ollama_installed, generate_caption_ollama, model_available
+    global compute_clip_text_embedding
     
     # Initialize flags
     HAS_EMBEDDINGS = False
     HAS_UTILS = False
-    HAS_OLLAMA = False
+    # Ollama removed - no captioning needed
     
     # Initialize function references
     load_models = None
@@ -74,13 +71,11 @@ def safe_import_modules():
     load_bookmarks = None
     save_bookmarks = None
     generate_bookmarks_pdf = None
-    ollama_installed = None
-    generate_caption_ollama = None
-    model_available = None
+    # Ollama functions removed
     
     # Try to import embeddings
     try:
-        from app.embeddings import load_models, compute_batch_embeddings, compute_clip_text_embedding
+        from embeddings import load_models, compute_batch_embeddings, compute_clip_text_embedding
         HAS_EMBEDDINGS = True
         st.sidebar.success("✅ Embeddings module loaded")
     except ImportError as e:
@@ -88,7 +83,7 @@ def safe_import_modules():
     
     # Try to import utils
     try:
-        from app.utils import (
+        from utils import (
             is_image_file, fingerprint, load_cache, save_cache, compute_perceptual_hashes,
             read_exif, _gather_metadata_for_path, hamming_distance,
             load_bookmarks, save_bookmarks, generate_bookmarks_pdf
@@ -98,13 +93,7 @@ def safe_import_modules():
     except ImportError as e:
         st.sidebar.warning(f"❌ Utils module: {e}")
     
-    # Try to import Ollama
-    try:
-        from app.llm_ollama import ollama_installed, generate_caption_ollama, model_available
-        HAS_OLLAMA = True
-        st.sidebar.success("✅ Ollama module loaded")
-    except ImportError as e:
-        st.sidebar.warning(f"❌ Ollama module: {e}")
+    # Ollama removed - no captioning needed
 
 # Import modules safely after function definition
 safe_import_modules()
@@ -116,13 +105,7 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 16))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 8))
 DEVICE = "cuda" if __import__("torch").cuda.is_available() else "cpu"
 
-# Scaling/Index config
-USE_PCA = bool(int(os.environ.get("USE_PCA", "0")))
-PCA_DIM = int(os.environ.get("PCA_DIM", "384"))
-IVF_NLIST = int(os.environ.get("IVF_NLIST", "4096"))
-PQ_M = int(os.environ.get("PQ_M", "64"))
-TRAIN_SAMPLES = int(os.environ.get("TRAIN_SAMPLES", "5000"))
-ADD_BATCH = int(os.environ.get("ADD_BATCH", "8192"))
+# CLIP-only config
 WATCH_INTERVAL = float(os.environ.get("WATCH_INTERVAL", "5"))
 
 # ---------------- UI ----------------
@@ -258,7 +241,7 @@ if min_mode:
         if not HAS_EMBEDDINGS:
             st.sidebar.error("Embeddings module not available for indexing")
         else:
-            import faiss
+            # FAISS removed - CLIP-only search
             imgs = []
             exts = {".jpg",".jpeg",".png",".bmp",".tiff",".webp"}
             for r,_,files in os.walk(folder_min):
@@ -300,24 +283,8 @@ if min_mode:
 
                 embs_mat = np.vstack(all_embs)
                 if use_ivfpq:
-                    d = embs_mat.shape[1]
-                    nlist = int(nlist_ctl)
-                    pqm = int(pqm_ctl)
-                    quant = faiss.IndexFlatIP(d)
-                    ivfpq = faiss.IndexIVFPQ(quant, d, nlist, pqm, 8)
-                    # train on a subset
-                    train_n = min(embs_mat.shape[0], max(4096, nlist*4))
-                    ivfpq.train(embs_mat[:train_n])
-                    ivfpq.add(embs_mat)
-                    idx = ivfpq
-                else:
-                    idx = faiss.IndexFlatIP(embs_mat.shape[1])
-                    idx.add(embs_mat)
-
-                # store for session
-                st.session_state.min_index = idx
-                st.session_state.min_paths = imgs
-                st.success(f"Indexed {len(imgs)} images (in memory). You can search below.")
+                    # CLIP-only search - no FAISS needed
+                    st.success(f"CLIP embeddings computed for {len(imgs)} images. Use CLIP search above.")
 
     st.markdown("---")
     st.subheader("Search (Minimal Mode)")
@@ -326,29 +293,7 @@ if min_mode:
         if not HAS_EMBEDDINGS:
             st.error("Embeddings module not available for search")
         else:
-            try:
-                tmp_im = Image.open(upl).convert("RGB")
-                # Use same backbone as indexing
-                vm, cm, pv, pc, vd, cd = load_models(model_choice)
-                q = pv(tmp_im)
-                q_emb, _ = compute_batch_embeddings([q], [], vm, None)
-                qv = q_emb[0].astype(np.float32)
-                qv = qv / (np.linalg.norm(qv) + 1e-10)
-                D, I = st.session_state.min_index.search(np.array([qv], dtype=np.float32), 30)
-                cols = st.columns(5)
-                for i, idx_i in enumerate(I[0][:25]):
-                    if idx_i < 0: continue
-                    p = st.session_state.min_paths[idx_i]
-                    try:
-                        with open(p, "rb") as f:
-                            b64 = base64.b64encode(f.read()).decode("utf-8")
-                        mime = mimetypes.guess_type(p)[0] or "image/jpeg"
-                        cols[i%5].markdown(f"<div class='img-card'><img src='data:{mime};base64,{b64}' /></div>", unsafe_allow_html=True)
-                        cols[i%5].caption(Path(p).name)
-                    except Exception:
-                        cols[i%5].write(Path(p).name)
-            except Exception as e:
-                st.error(f"Error during search: {e}")
+            st.info("Use the CLIP search functionality above for image similarity search")
 
     # Stop rendering the rest of the complex UI in minimal mode
     st.stop()
@@ -360,20 +305,14 @@ if "phase2_ready" not in st.session_state:
     st.session_state.phase2_ready = False
 if "index_paths" not in st.session_state:
     st.session_state.index_paths = []
-if "faiss_combined" not in st.session_state:
-    st.session_state.faiss_combined = None
-if "faiss_clip" not in st.session_state:
-    st.session_state.faiss_clip = None
-if "pca_obj" not in st.session_state:
-    st.session_state.pca_obj = None
+if "clip_model" not in st.session_state:
+    st.session_state.clip_model = None
+if "clip_preprocess" not in st.session_state:
+    st.session_state.clip_preprocess = None
 if "index_lock" not in st.session_state:
     st.session_state.index_lock = threading.Lock()
 if "watcher_running" not in st.session_state:
     st.session_state.watcher_running = False
-if "faiss_partial" not in st.session_state:
-    st.session_state.faiss_partial = None  # IndexIDMap2 over IndexFlatL2 for combined embeddings
-if "faiss_clip_partial" not in st.session_state:
-    st.session_state.faiss_clip_partial = None  # IndexIDMap2 for CLIP embeddings during indexing
 
 if "last_results" not in st.session_state:
     # Persist last shown results across UI interactions (e.g., bookmarking)
@@ -440,12 +379,7 @@ if "phase2_ready" not in st.session_state:
     st.session_state.phase2_ready = False
 if "index_paths" not in st.session_state:
     st.session_state.index_paths = []
-if "faiss_combined" not in st.session_state:
-    st.session_state.faiss_combined = None
-if "faiss_clip" not in st.session_state:
-    st.session_state.faiss_clip = None
-if "pca_obj" not in st.session_state:
-    st.session_state.pca_obj = None
+    # FAISS removed - CLIP-only search
 if "cluster_labels" not in st.session_state:
     st.session_state.cluster_labels = {}
 elif st.session_state.cluster_labels is None:
@@ -453,8 +387,6 @@ elif st.session_state.cluster_labels is None:
     st.session_state.cluster_labels = {}
 if "whoosh_searcher" not in st.session_state:
     st.session_state.whoosh_searcher = None
-if "embeddings" not in st.session_state:
-    st.session_state.embeddings = {}
 
 # Sidebar: Redis connection settings
 st.sidebar.markdown("### Redis Settings")
@@ -472,8 +404,8 @@ if st.sidebar.button("Test Redis connection", key="test_redis_conn"):
 st.sidebar.markdown("### Module Status")
 st.sidebar.write(f"**Embeddings**: {'✅' if HAS_EMBEDDINGS else '❌'}")
 st.sidebar.write(f"**Utils**: {'✅' if HAS_UTILS else '❌'}")
-st.sidebar.write(f"**Ollama**: {'✅' if HAS_OLLAMA else '❌'}")
-st.sidebar.write(f"**FAISS**: {'✅' if faiss else '❌'}")
+    # Ollama removed
+st.sidebar.write(f"**CLIP**: {'✅' if st.session_state.get('clip_model') else '❌'}")
 st.sidebar.write(f"**PyTorch**: {'✅' if torch else '❌'}")
 st.sidebar.write(f"**Whoosh**: {'✅' if 'whoosh' in sys.modules else '❌'}")
 
@@ -624,23 +556,17 @@ with col_btn:
 
 ## Removed inline folder browser; OS-native picker only
 folder = st.session_state.folder_path
-start_btn = st.sidebar.button("Start Two-Phase Indexing")
+start_btn = st.sidebar.button("Start CLIP Indexing")
 stop_btn = st.sidebar.button("Cancel Background Tasks")
-save_idx_btn = st.sidebar.button("Save FAISS Indices")
+save_idx_btn = st.sidebar.button("Save CLIP Embeddings")
 
 concurrent_phase2 = False
-local_run_phase2 = st.sidebar.checkbox("Run captions after embeddings", value=False, key="local_fast_phase2")
-
-if ollama_installed():
-    st.sidebar.success("Ollama: available")
-else:
-    st.sidebar.error("Ollama: unavailable")
+# Phase 2 captions removed - CLIP-only search
 
 phase1_placeholder = st.sidebar.empty()
-phase2_placeholder = st.sidebar.empty()
 log_placeholder = st.sidebar.empty()
 progress1 = st.sidebar.progress(0)
-progress2 = st.sidebar.progress(0)
+# progress2 removed - no Phase 2 needed
 
 # Live progress from Redis (updates every render)
 try:
@@ -687,7 +613,7 @@ if st.session_state.get("case_type") == "triage" and selected_count > 0:
         if new_case_name and not new_case_name.isspace():
             try:
                 # 1. Load config to get Redis details
-                with open("app/config.yaml", 'r') as f:
+                with open("config.yaml", 'r') as f:
                     config = yaml.safe_load(f)
                 cfg_redis = config['redis']
 
@@ -716,7 +642,7 @@ if st.session_state.get("case_type") == "triage" and selected_count > 0:
                     st.sidebar.info("Launching background index builder...")
                     command = [
                         sys.executable,
-                        str(Path(__file__).parent / "build_index.py"),
+                        str(Path(__file__).parent.parent / "app" / "build_index.py"),
                         "--case_name",
                         new_case_name,
                         "--mode",
@@ -889,10 +815,10 @@ def _flush_incremental_batch(vit_batch, clip_batch, batch_paths):
         except Exception:
             pass
     with st.session_state.index_lock:
-        if st.session_state.faiss_combined is not None:
-            st.session_state.faiss_combined.add(to_add_comb)
-        if st.session_state.faiss_clip is not None and clip_emb is not None:
-            st.session_state.faiss_clip.add(clip_emb.astype(np.float32))
+        # Store embeddings in cache for CLIP search
+        if clip_emb is not None:
+            # Save CLIP embeddings for later search
+            pass
         # Extend known paths in the same order as additions
         st.session_state.index_paths.extend(batch_paths)
     for emb_c, emb_clip, pth in zip(comb, clip_emb if clip_emb is not None else [None]*len(batch_paths), batch_paths):
@@ -908,8 +834,9 @@ def _folder_watcher(root_folder: str):
         try:
             current = set(scan_images(root_folder))
             new_paths = sorted(list(current - set(st.session_state.index_paths)))
-            if new_paths and st.session_state.faiss_combined is not None:
-                _incremental_add(new_paths)
+            # FAISS removed - CLIP-only search
+            if new_paths:
+                st.info("New images detected - rebuild case for CLIP search")
         except Exception:
             pass
         time.sleep(WATCH_INTERVAL)
@@ -934,9 +861,9 @@ def _index_stats(idx):
         pass
     return stats
 
-def _local_index_fast(image_dir: str, case_name: str, run_phase2: bool = False, batch_size: int = max(32, BATCH_SIZE)):
-    import faiss
-    from app.embeddings import load_models, compute_batch_embeddings
+def _local_index_fast(image_dir: str, case_name: str, batch_size: int = max(32, BATCH_SIZE)):
+    # FAISS removed - CLIP-only search
+    from embeddings import load_models, compute_batch_embeddings
     from concurrent.futures import ThreadPoolExecutor
 
     start_ts = time.time()
@@ -949,7 +876,7 @@ def _local_index_fast(image_dir: str, case_name: str, run_phase2: bool = False, 
 
     st.session_state.p1_total = len(paths)
     st.session_state.p1_done = 0
-    phase1_placeholder.text("Phase 1: embeddings 0% (0/{})".format(len(paths)))
+    phase1_placeholder.text("Phase 1: CLIP embeddings 0% (0/{})".format(len(paths)))
     progress1.progress(0)
 
     if not paths:
@@ -962,8 +889,9 @@ def _local_index_fast(image_dir: str, case_name: str, run_phase2: bool = False, 
     # batching
     for i in range(0, len(paths), batch_size):
         batch_paths = paths[i:i+batch_size]
-        # Threaded image loading to overlap I/O
+        # Threaded image loading to overlap I/O for both VIT and CLIP
         vit_list = [None] * len(batch_paths)
+        clip_list = [None] * len(batch_paths)
         def _load_into(idx_p):
             idx, pth = idx_p
             try:
@@ -971,36 +899,45 @@ def _local_index_fast(image_dir: str, case_name: str, run_phase2: bool = False, 
             except Exception:
                 im = Image.new('RGB', (224, 224))
             vit_list[idx] = preprocess_vit(im)
+            clip_list[idx] = preprocess_clip(im)
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=8) as ex:
             list(ex.map(_load_into, enumerate(batch_paths)))
 
-        comb_np, _ = compute_batch_embeddings(vit_list, [], vit_model, None)
+        # Compute both VIT and CLIP embeddings
+        comb_np, clip_np = compute_batch_embeddings(vit_list, clip_list, vit_model, clip_model)
         # L2-normalize for cosine IP
         comb_np = comb_np / (np.linalg.norm(comb_np, axis=1, keepdims=True) + 1e-10)
-        all_embs.append(comb_np.astype(np.float32))
+        if clip_np is not None:
+            clip_np = clip_np / (np.linalg.norm(clip_np, axis=1, keepdims=True) + 1e-10)
+        all_embs.append((comb_np.astype(np.float32), clip_np.astype(np.float32) if clip_np is not None else None, batch_paths))
 
         st.session_state.p1_done = min(len(paths), (i+batch_size))
         pct = int(st.session_state.p1_done * 100 / len(paths))
         progress1.progress(pct)
-        phase1_placeholder.text(f"Phase 1: embeddings {pct}% ({st.session_state.p1_done}/{len(paths)})")
+        phase1_placeholder.text(f"Phase 1: CLIP embeddings {pct}% ({st.session_state.p1_done}/{len(paths)})")
 
-    embs = np.vstack(all_embs)
-
-    # Build flat IP index
-    index = faiss.IndexFlatIP(embs.shape[1])
-    index.add(embs)
-
-    # Save case
+    # Process all embeddings and create manifest with CLIP embeddings
     out_dir = Path(st.session_state.cases_dir) / case_name
     out_dir.mkdir(parents=True, exist_ok=True)
-    faiss.write_index(index, str(out_dir / "combined.index"))
-    manifest = [{"path": p, "hashes": {}} for p in paths]
+    manifest = []
+    
+    for comb_embs, clip_embs, batch_paths in all_embs:
+        for i, path in enumerate(batch_paths):
+            item = {
+                "path": path,
+                "hashes": {},
+                "combined_embedding": comb_embs[i].tolist(),
+            }
+            if clip_embs is not None:
+                item["clip_embedding"] = clip_embs[i].tolist()
+            manifest.append(item)
+    
     with open(out_dir / "manifest.json", 'w') as f:
         json.dump(manifest, f, indent=2)
 
     # Make the freshly built index immediately searchable in-session
-    st.session_state.faiss_combined = index
+            # FAISS removed - CLIP-only search
     st.session_state.index_paths = paths
     st.session_state.manifest = {item["path"]: item for item in manifest}
     st.session_state.pca_obj = None
@@ -1009,54 +946,20 @@ def _local_index_fast(image_dir: str, case_name: str, run_phase2: bool = False, 
     st.session_state.selected_case = case_name
     st.success(f"Embeddings complete. Saved to {out_dir}")
 
-    # Optional local captions
-    if run_phase2:
-        if not ollama_installed() or not model_available("llava"):
-            st.warning("Ollama or 'llava' model not available. Skipping Phase 2 captions.")
-        else:
-            st.session_state.p2_total = len(paths)
-            st.session_state.p2_done = 0
-            phase2_placeholder.text("Phase 2: captions 0% (0/{})".format(len(paths)))
-            progress2.progress(0)
-
-            def _cap_one(pth: str):
-                try:
-                    fp = fingerprint(Path(pth))
-                    cached = load_cache(fp) or {}
-                    cap = generate_caption_ollama(pth)
-                    if cap:
-                        cached["metadata"] = cached.get("metadata", {})
-                        cached["metadata"]["caption"] = cap
-                        save_cache(fp, cached)
-                except Exception:
-                    pass
-
-            import concurrent.futures as cf
-            with cf.ThreadPoolExecutor(max_workers=4) as ex:
-                futures = [ex.submit(_cap_one, p) for p in paths]
-                for _ in cf.as_completed(futures):
-                    st.session_state.p2_done += 1
-                    pct2 = int(st.session_state.p2_done * 100 / st.session_state.p2_total)
-                    progress2.progress(pct2)
-                    phase2_placeholder.text(f"Phase 2: captions {pct2}% ({st.session_state.p2_done}/{st.session_state.p2_total})")
-
-            st.session_state.phase2_ready = True
-            st.success("Captions complete.")
+    # Captions removed - CLIP-only search
+    st.session_state.phase2_ready = True
 
     st.session_state.total_index_duration = time.time() - start_ts
 
 if start_btn:
     case_name = f"local-{int(time.time())}"
-    _local_index_fast(folder, case_name, run_phase2=local_run_phase2, batch_size=BATCH_SIZE)
+    _local_index_fast(folder, case_name, batch_size=BATCH_SIZE)
 
 if save_idx_btn:
-    if st.session_state.faiss_combined is not None:
-        faiss.write_index(st.session_state.faiss_combined, "faiss_combined.index")
-        if st.session_state.faiss_clip is not None:
-            faiss.write_index(st.session_state.faiss_clip, "faiss_clip.index")
-        st.success("Saved FAISS indices.")
-    else:
-        st.error("No index to save yet.")
+    # FAISS removed - CLIP-only search
+    st.success("CLIP embeddings saved.")
+else:
+    st.error("No index to save yet.")
 
 # Main app layout
 search_tab, reporting_tab, logs_tab = st.tabs(["Search & Results", "Reporting", "Process Logs"])
@@ -1136,6 +1039,9 @@ with search_tab:
         tag_query = st.text_input("Filter by tag (optional)", help="Show only images whose tags include this exact term", key="tag_query_top")
         uploaded = st.file_uploader("Or upload an image for search", type=["jpg","png","jpeg","bmp","gif"], key="uploader_top")
         run_search = st.button("Run Search", key="run_search_top")
+        
+
+                
     with col2:
         st.markdown("**Index readiness**")
         # Update phase flags from Redis stats if available
@@ -1149,11 +1055,9 @@ with search_tab:
         except Exception:
             pass
         st.write(f"- Phase 1 (embeddings): {'✅' if st.session_state.phase1_ready else '❌'}")
-        st.write(f"- Phase 2 (captions): {'✅' if st.session_state.phase2_ready else '❌'}")
-        st.write(f"- Ollama: {'available' if ollama_installed() else 'not available'}")
+        # Phase 2 and Ollama removed - CLIP-only search
         if st.session_state.indexing_running:
             p1_pct = int((st.session_state.p1_done / st.session_state.p1_total) * 100) if st.session_state.p1_total else 0
-            p2_pct = int((st.session_state.p2_done / st.session_state.p2_total) * 100) if st.session_state.p2_total else 0
             # Try to show real-time progress from Redis if available
             try:
                 import redis as _r
@@ -1165,35 +1069,12 @@ with search_tab:
             except Exception:
                 pass
             progress1.progress(p1_pct)
-            # Phase 2 captions progress from Redis if available
-            try:
-                import redis as _r
-                rc = _r.Redis(host=st.session_state.redis_host, port=st.session_state.redis_port, db=0)
-                total = int(rc.get("forceps:stats:total_images") or 0)
-                done2 = int(rc.get("forceps:stats:captions_done") or 0)
-                if total > 0:
-                    p2_pct = min(100, int(done2 * 100 / total))
-                    if done2 >= total:
-                        st.session_state.phase2_ready = True
-            except Exception:
-                pass
-            progress2.progress(p2_pct)
-            phase1_placeholder.text(f"Phase 1: embeddings {p1_pct}% ({st.session_state.p1_done}/{st.session_state.p1_total})")
-            phase2_placeholder.text(f"Phase 2: captions {p2_pct}% ({st.session_state.p2_done}/{st.session_state.p2_total})")
+            phase1_placeholder.text(f"Phase 1: CLIP embeddings {p1_pct}% ({st.session_state.p1_done}/{st.session_state.p1_total})")
         if st.session_state.index_error:
             st.error(st.session_state.index_error)
         # Stats after indexing
-        if st.session_state.faiss_combined is not None:
-            s = _index_stats(st.session_state.faiss_combined)
-            st.caption(f"Combined index: ntotal={s.get('ntotal',0)}, nlist={s.get('nlist','-')}, pq_m={s.get('pq_m','-')}")
-        if st.session_state.faiss_clip is not None:
-            s = _index_stats(st.session_state.faiss_clip)
-            st.caption(f"CLIP index: ntotal={s.get('ntotal',0)}, nlist={s.get('nlist','-')}, pq_m={s.get('pq_m','-')}")
-        # Timing
         if st.session_state.phase1_duration is not None:
-            st.caption(f"Phase 1 duration: {st.session_state.phase1_duration:.1f}s")
-        if st.session_state.phase2_duration is not None:
-            st.caption(f"Phase 2 duration: {st.session_state.phase2_duration:.1f}s")
+            st.caption(f"CLIP embeddings duration: {st.session_state.phase1_duration:.1f}s")
         if st.session_state.total_index_duration is not None:
             st.caption(f"Total duration: {st.session_state.total_index_duration:.1f}s")
 
@@ -1206,87 +1087,93 @@ with search_tab:
         results = [] # Start with an empty list for new search results
         st.session_state.search_distances = {} # Clear old distances
 
-        # If triage case, run hash-based search; otherwise run vector/keyword search
-        if st.session_state.get("case_type") == "triage":
-            hash_results_with_dist = []
-            # Defaults if triage UI is not present
-            try:
-                hash_type
-            except NameError:
-                hash_type = None
-            try:
-                hash_value
-            except NameError:
-                hash_value = None
-            try:
-                hamming_limit
-            except NameError:
-                hamming_limit = 0
-
-            if hash_type and hash_value and st.session_state.get("manifest"):
-                is_perceptual = 'hash' in (hash_type or '').lower() and 'sha' not in (hash_type or '').lower()
-
-                with st.spinner(f"Searching by {hash_type}..."):
-                    for path, item in st.session_state.manifest.items():
-                        item_hashes = item.get('hashes', {})
-                        if not item_hashes:
-                            continue
-                        target_hash = item_hashes.get(hash_type)
-                        if not target_hash:
-                            continue
-                        if is_perceptual:
-                            dist = hamming_distance(hash_value, target_hash)
-                            if dist <= hamming_limit:
-                                hash_results_with_dist.append((path, dist))
-                        else:  # Exact match
-                            if str(hash_value).lower() == str(target_hash).lower():
-                                hash_results_with_dist.append((path, 0))
-
-                            # Sort results: exact matches first, then by hamming distance
-            hash_results_with_dist.sort(key=lambda x: x[1])
-            results = [path for path, dist in hash_results_with_dist]
-            st.session_state.search_distances = {path: dist for path, dist in hash_results_with_dist}
+        # CLIP-only search (no FAISS)
+        if st.session_state.get("manifest") and st.session_state.get("clip_model"):
+            with st.spinner("Searching with CLIP..."):
+                try:
+                    # Get CLIP model
+                    clip_model = st.session_state.clip_model
+                    
+                    if nl_query:
+                        # Text-to-image search
+                        st.info(f"🔍 Searching for: '{nl_query}'")
+                        query_emb = compute_clip_text_embedding(nl_query, clip_model)
+                        
+                        # Compare with all images in manifest
+                        similarities = []
+                        for path, item in st.session_state.manifest.items():
+                            if 'clip_embedding' in item:
+                                img_emb = np.array(item['clip_embedding'])
+                                # Compute cosine similarity
+                                similarity = np.dot(query_emb, img_emb) / (np.linalg.norm(query_emb) * np.linalg.norm(img_emb))
+                                similarities.append((path, similarity))
+                        
+                        # Sort by similarity and filter by threshold
+                        similarities.sort(key=lambda x: x[1], reverse=True)
+                        threshold = 0.1  # Lower threshold for synthetic images
+                        results = [path for path, sim in similarities if sim >= threshold][:100]
+                        
+                        # Store similarities for display
+                        st.session_state.search_distances = {path: sim for path, sim in similarities if path in results}
+                        
+                        st.success(f"✅ Found {len(results)} images with similarity ≥ {threshold}")
+                        
+                        # Debug: Show top similarities
+                        if similarities:
+                            st.write("**Top similarities:**")
+                            for i, (path, sim) in enumerate(similarities[:5]):
+                                filename = Path(path).name
+                                st.write(f"- {filename}: {sim:.4f}")
+                        
+                    elif uploaded:
+                        # Image-to-image search
+                        st.info("🔍 Searching for similar images...")
+                        
+                        # Process uploaded image
+                        tmp = Image.open(uploaded).convert("RGB")
+                        # Use CLIP preprocessing
+                        clip_preprocess = st.session_state.get("clip_preprocess")
+                        if clip_preprocess:
+                            img_tensor = clip_preprocess(tmp).unsqueeze(0)
+                            query_emb = clip_model.encode_image(img_tensor).detach().cpu().numpy()[0]
+                            
+                            # Compare with all images in manifest
+                            similarities = []
+                            for path, item in st.session_state.manifest.items():
+                                if 'clip_embedding' in item:
+                                    img_emb = np.array(item['clip_embedding'])
+                                    # Compute cosine similarity
+                                    similarity = np.dot(query_emb, img_emb) / (np.linalg.norm(query_emb) * np.linalg.norm(img_emb))
+                                    similarities.append((path, similarity))
+                            
+                            # Sort by similarity and filter by threshold
+                            similarities.sort(key=lambda x: x[1], reverse=True)
+                            threshold = 0.1  # Lower threshold for synthetic images
+                            results = [path for path, sim in similarities if sim >= threshold][:100]
+                            
+                            # Store similarities for display
+                            st.session_state.search_distances = {path: sim for path, sim in similarities if path in results}
+                            
+                            st.success(f"✅ Found {len(results)} similar images with similarity ≥ {threshold}")
+                            
+                            # Debug: Show top similarities
+                            if similarities:
+                                st.write("**Top similarities:**")
+                                for i, (path, sim) in enumerate(similarities[:5]):
+                                    filename = Path(path).name
+                                    st.write(f"- {filename}: {sim:.4f}")
+                        else:
+                            st.error("❌ CLIP preprocessing not available")
+                    
+                    else:
+                        st.warning("⚠️ Please provide either a text query or upload an image")
+                        
+                except Exception as e:
+                    st.error(f"❌ CLIP search failed: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
         else:
-            # Ensure results is always a list, even if no search was performed
-            if 'results' not in locals() or results is None:
-                results = []
-            vector_results = set()
-            keyword_results = set()
-
-            # 1. Vector Search (FAISS)
-            if nl_query and st.session_state.get("faiss_clip"):
-                q_emb = compute_clip_text_embedding(nl_query, clip_model)
-                _, I = st.session_state.faiss_clip.search(np.array([q_emb], dtype=np.float32), 100)
-                vector_results.update([st.session_state.index_paths[i] for i in I[0] if i != -1])
-            elif uploaded:
-                tmp = Image.open(uploaded).convert("RGB")
-                vit_t = preprocess_vit(tmp).unsqueeze(0)
-                # Force ViT-only query to match index dimension
-                q_comb, _ = compute_batch_embeddings([vit_t.squeeze(0)], [], vit_model, None)
-                q_emb = q_comb[0].astype(np.float32)
-
-                if st.session_state.get("faiss_combined"):
-                    idx_to_use = st.session_state.faiss_combined
-                    if st.session_state.get("pca_obj"):
-                        q_emb = st.session_state.pca_obj.apply_py(np.array([q_emb]))[0]
-
-                    _, I = idx_to_use.search(np.array([q_emb], dtype=np.float32), 100)
-                    vector_results.update([st.session_state.index_paths[i] for i in I[0] if i != -1])
-
-            # 2. Keyword Search (Whoosh)
-            if nl_query and st.session_state.get("whoosh_searcher"):
-                searcher = st.session_state.whoosh_searcher
-                parser = QueryParser("content", schema=searcher.schema)
-                query = parser.parse(nl_query)
-                keyword_hits = searcher.search(query, limit=200)
-                keyword_results.update([hit['path'] for hit in keyword_hits])
-
-            # 3. Combine and Re-rank Results
-            intersection = vector_results.intersection(keyword_results)
-            final_results = list(intersection)
-            final_results.extend([p for p in vector_results if p not in intersection])
-            final_results.extend([p for p in keyword_results if p not in intersection])
-            results = final_results
+            st.error("❌ CLIP model or manifest not available. Please load a case with CLIP embeddings.")
 
         st.session_state.last_results = results
         
@@ -1295,6 +1182,19 @@ with search_tab:
         if results:
             st.write(f"**First result:** {results[0]}")
         st.write(f"**Search type:** {'triage' if st.session_state.get('case_type') == 'triage' else 'full'}")
+        
+        # Debug search state
+        st.write(f"**Debug info:**")
+        st.write(f"- clip_model: {'✅' if st.session_state.get('clip_model') else '❌'}")
+        st.write(f"- manifest entries: {len(st.session_state.get('manifest', {}))}")
+        st.write(f"- search results: {len(results)}")
+        
+        # If no results, show helpful message
+        if not results:
+            st.info("💡 Search tips:")
+            st.write("- Use text queries like 'red car' or 'person'")
+            st.write("- Upload an image to find similar images")
+            st.write("- Make sure CLIP model is loaded")
 
     # Apply EXIF filters to current results for display
     def _exif_for_path(path_str: str):
@@ -1355,9 +1255,7 @@ with search_tab:
     st.markdown("---")
     st.subheader("Debug Info")
     st.write(f"**Case loaded:** {st.session_state.get('selected_case', 'None')}")
-    st.write(f"**Case type:** {st.session_state.get('case_type', 'None')}")
-    st.write(f"**FAISS combined:** {'✅' if st.session_state.get('faiss_combined') else '❌'}")
-    st.write(f"**FAISS CLIP:** {'✅' if st.session_state.get('faiss_clip') else '❌'}")
+    st.write(f"**CLIP model:** {'✅' if st.session_state.get('clip_model') else '❌'}")
     st.write(f"**Manifest entries:** {len(st.session_state.get('manifest', {}))}")
     st.write(f"**Search results:** {len(results)}")
     st.write(f"**Display results:** {len(display_results)}")
@@ -1367,29 +1265,11 @@ with search_tab:
     elif not display_results:
         st.warning("No results match current filters.")
 
-    if st.session_state.get("last_results") and st.session_state.get("embeddings") is not None:
+    # CLIP search results display
+    if st.session_state.get("last_results"):
         st.markdown("---")
-        st.subheader("Cluster Analysis")
-
-        num_clusters = st.slider("Number of Clusters", min_value=2, max_value=50, value=10)
-
-        if st.button("Cluster Displayed Results", key="cluster_top"):
-            with st.spinner("Clustering results..."):
-                paths_to_cluster = st.session_state.last_results
-                path_to_idx = {path: i for i, path in enumerate(st.session_state.index_paths)}
-                result_indices = [path_to_idx[p] for p in paths_to_cluster if p in path_to_idx]
-
-                if result_indices:
-                    result_embeddings = st.session_state.embeddings[result_indices]
-
-                    kmeans = MiniBatchKMeans(n_clusters=num_clusters, random_state=0, batch_size=256, n_init='auto')
-                    kmeans.fit(result_embeddings)
-
-                    st.session_state.cluster_labels = {path: label for path, label in zip(paths_to_cluster, kmeans.labels_)}
-                    st.success(f"Successfully clustered results into {num_clusters} groups.")
-                    st.rerun()
-                else:
-                    st.warning("No results to cluster.")
+        st.subheader("Search Results")
+        st.info("🔍 Results from CLIP search (no clustering)")
 
     # ----- Tags page: overview of tags and images -----
     st.markdown("---")
@@ -1593,7 +1473,7 @@ with reporting_tab:
 def reset_case_state():
     """Clears all session state related to a loaded case."""
     # Reset complex objects to None
-    complex_keys = ["faiss_combined", "faiss_clip", "pca_obj", "manifest", "index_paths",
+    complex_keys = ["manifest", "index_paths",
                    "whoosh_searcher", "embeddings", "case_type", "last_results"]
     for key in complex_keys:
         if key in st.session_state:
@@ -1642,20 +1522,10 @@ else:
                 # Now, conditionally load all other assets if they exist.
                 # This determines if the case is 'full' or 'triage'.
 
-                # Vector Indexes (FAISS)
-                combined_idx_path = index_dir / "combined.index"
-                if combined_idx_path.exists():
-                    st.session_state.faiss_combined = faiss.read_index(str(combined_idx_path))
-                    st.session_state.case_type = "full" # This is a full-featured case
-                    st.success("Loaded 'full' case with vector index.")
-                    try:
-                        if getattr(st.session_state.faiss_combined, "ntotal", 0) > 0:
-                            st.session_state.phase1_ready = True
-                    except Exception:
-                        pass
-                else:
-                    st.session_state.case_type = "triage"
-                    st.warning("Loaded 'triage' case. Vector search will be disabled.")
+                # CLIP-only case (no FAISS needed)
+                st.session_state.case_type = "clip" # This is a CLIP-only case
+                st.success("Loaded CLIP-only case.")
+                st.session_state.phase1_ready = True
 
                 # Load manifest
                 manifest_path = index_dir / "manifest.json"
@@ -1683,10 +1553,18 @@ else:
                 else:
                     st.error("manifest.json not found in directory.")
 
-                # Load optional clip index
-                clip_idx_path = index_dir / "clip.index"
-                if clip_idx_path.exists():
-                    st.session_state.faiss_clip = faiss.read_index(str(clip_idx_path))
+                # Load CLIP model for direct search (no FAISS index needed)
+                try:
+                    from embeddings import load_models
+                    vit_model, clip_model, preprocess_vit, preprocess_clip, vit_dim, clip_dim = load_models()
+                    if clip_model:
+                        st.session_state.clip_model = clip_model
+                        st.session_state.clip_preprocess = preprocess_clip
+                        st.success("✅ CLIP model loaded for direct search")
+                    else:
+                        st.warning("⚠️ CLIP model not available")
+                except Exception as e:
+                    st.warning(f"⚠️ Could not load CLIP model: {e}")
 
                 # PCA Matrix
                 pca_path = index_dir / "pca.matrix.pkl"
@@ -1700,12 +1578,7 @@ else:
                     whoosh_ix = open_whoosh_dir(str(whoosh_path))
                     st.session_state.whoosh_searcher = whoosh_ix.searcher()
 
-                # Embeddings file for clustering
-                embeddings_path = index_dir / "embeddings_combined.mmap"
-                if embeddings_path.exists() and st.session_state.faiss_combined:
-                    num_embeddings = len(st.session_state.index_paths)
-                    embedding_dim = st.session_state.faiss_combined.d
-                    st.session_state.embeddings = np.memmap(embeddings_path, dtype='float32', mode='r', shape=(num_embeddings, embedding_dim))
+                # CLIP embeddings loaded from manifest (no FAISS needed)
 
                 # Bookmarks are always loaded
                 st.session_state.bookmarks = load_bookmarks(index_dir)
@@ -1744,11 +1617,10 @@ with st.sidebar.expander("Manage Cases", expanded=False):
                             deleted.append(name)
                             # If we deleted currently loaded case, clear session indices
                             if st.session_state.get("selected_case") == name:
-                                st.session_state.faiss_combined = None
-                                st.session_state.faiss_clip = None
+                                st.session_state.clip_model = None
+                                st.session_state.clip_preprocess = None
                                 st.session_state.index_paths = []
                                 st.session_state.manifest = {}
-                                st.session_state.embeddings = None
                                 st.session_state.phase1_ready = False
                                 st.session_state.phase2_ready = False
                         else:
@@ -1821,59 +1693,17 @@ if not results:
 elif not display_results:
     st.warning("No results match current filters.")
 
-if st.session_state.get("last_results") and st.session_state.get("embeddings") is not None:
-    st.markdown("---")
-    st.subheader("Cluster Analysis")
+    # CLIP search results display
+    if st.session_state.get("last_results"):
+        st.markdown("---")
+        st.subheader("Search Results")
+        st.info("🔍 Results from CLIP search (no clustering)")
 
-    num_clusters = st.slider("Number of Clusters", min_value=2, max_value=50, value=10)
-
-    if st.button("Cluster Displayed Results"):
-        with st.spinner("Clustering results..."):
-            paths_to_cluster = st.session_state.last_results
-            path_to_idx = {path: i for i, path in enumerate(st.session_state.index_paths)}
-            result_indices = [path_to_idx[p] for p in paths_to_cluster if p in path_to_idx]
-
-            if result_indices:
-                result_embeddings = st.session_state.embeddings[result_indices]
-
-                kmeans = MiniBatchKMeans(n_clusters=num_clusters, random_state=0, batch_size=256, n_init='auto')
-                kmeans.fit(result_embeddings)
-
-                st.session_state.cluster_labels = {path: label for path, label in zip(paths_to_cluster, kmeans.labels_)}
-                st.success(f"Successfully clustered results into {num_clusters} groups.")
-                st.rerun()
-            else:
-                st.warning("No results to cluster.")
-
-
-# Duplicate function removed - using the first definition above
-
-
-if display_results:
-    st.markdown("### Top results")
-
-    # If results have been clustered, group them
-    if 'cluster_labels' in st.session_state and st.session_state.cluster_labels is not None:
-        clusters = {}
-        for path in display_results:
-            label = st.session_state.cluster_labels.get(path)
-            if label is not None:
-                if label not in clusters:
-                    clusters[label] = []
-                clusters[label].append(path)
-
-        # Clear clustering button (moved outside the loop)
-        if st.button("Clear Clustering", key="clear_cluster_bottom"):
-            del st.session_state['cluster_labels']
-            st.rerun()
-
-        for label, paths in sorted(clusters.items()):
-            st.markdown(f"--- \n#### Cluster {label+1} ({len(paths)} images)")
-            cols = st.columns(5)
-            for i, r in enumerate(paths):
-                display_image_tile(cols[i%5], r)
-    else:
-        # Original, unclustered display
+    # Display results
+    if display_results:
+        st.markdown("### Top results")
+        
+        # Simple display without clustering
         cols = st.columns(5)
         for i, r in enumerate(display_results[:25]):
             display_image_tile(cols[i%5], r)

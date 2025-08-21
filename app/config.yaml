@@ -1,6 +1,9 @@
+# FORCEPS Optimized Configuration for Multi-Terabyte Processing
+# This configuration is optimized for high-throughput forensic analysis
+
 case_details:
-  case_name: "local-case"
-  case_description: "Run via local enqueuer/worker"
+  case_name: "forensic_case_2025"
+  case_description: "Multi-TB forensic analysis with optimized pipeline"
 
 redis:
   host: "127.0.0.1"
@@ -9,31 +12,129 @@ redis:
   results_queue: "forceps:results_queue"
 
 data:
-  input_dir: "/Users/Shared/Projects/2017"
+  input_dir: "/path/to/forensic/evidence"  # Update this path
   output_dir: "/Users/Shared/Projects/foreceps/output_index"
 
 models:
   onnx_dir: "/Users/Shared/Projects/foreceps/models/onnx"
+  vit_model: "google/vit-base-patch16-224-in21k"
+  clip_model: "ViT-B/32"
 
+# High-performance processing configuration
 performance:
+  # Compression level for Redis serialization (0-9, higher = better compression)
+  compression_level: 1
+  
+  # File scanner optimizations
+  scanner:
+    max_workers: 32              # Parallel file discovery workers
+    use_magic_numbers: true      # Fast file type detection
+    chunk_size: 10000           # Files per chunk
+    memory_optimized: false      # Use streaming for very large datasets
+  
+  # Worker process optimizations  
   worker:
-    batch_size: 64  # Increased batch size for better GPU utilization
-    max_workers: 16  # More parallel workers
+    batch_size: 256             # Large batches for GPU efficiency
+    max_workers: 4              # Number of worker processes per node
+    use_mixed_precision: true   # Enable FP16 for 2x speed improvement
+    enable_cuda_streams: true   # Async GPU operations
+  
+  # Job enqueuing optimizations
   enqueuer:
-    job_batch_size: 1024  # Larger job batches for better throughput
-    scan_max_workers: 32  # More parallel scanning
-  faiss:
-    use_pca: true
-    pca_dim: 384
-    ivf_nlist: 64
-    pq_m: 32
-    train_samples: 1000
-    add_batch: 100
+    job_batch_size: 2000        # Large job batches for Redis efficiency  
+    scan_max_workers: 16        # Parallel file processing workers
+    max_job_size: 1000          # Images per job (larger for efficiency)
+  
+  # Distributed processing optimizations
+  distributed:
+    min_workers: 2              # Minimum number of workers
+    max_workers: 16             # Maximum number of workers (auto-scaling)
+    scale_up_threshold: 500     # Queue depth to trigger scale-up
+    scale_down_threshold: 50    # Queue depth to trigger scale-down
+    worker_timeout: 300         # Worker heartbeat timeout (seconds)
+  
+  # CLIP-only search (no FAISS)
+  clip:
+    model: "ViT-B/32"          # CLIP model to use
+    enable_text_search: true    # Enable text-to-image search
+    enable_image_search: true   # Enable image-to-image search
+    search_k: 100              # Number of results to return
+    similarity_threshold: 0.7   # Minimum similarity score
+  
+  # Memory management
+  memory:
+    max_batch_memory_gb: 2     # Maximum memory per batch
+    enable_memory_mapping: true # Use memory mapping for large files
+    clear_cache_interval: 1000  # Clear caches every N images
+  
+  # I/O optimizations
+  io:
+    prefetch_batches: 3        # Number of batches to prefetch
+    use_turbojpeg: true        # Fast JPEG decoding
+    parallel_loading: true     # Parallel image loading
+    io_threads: 8              # Number of I/O threads
 
+# Hashing configuration for forensic integrity
 hashing:
-  - "sha256"
-  - "perceptual"
+  - "sha256"      # Cryptographic hash for integrity
+  - "perceptual"  # Perceptual hashing for similarity
 
+# Feature flags
 features:
-  enable_captions: false  # Disabled to reduce cost and complexity
+  enable_captions: false       # Disable captioning for speed
+  enable_clip: true           # Enable CLIP for text-to-image search
+  enable_faiss: false         # Disable FAISS index building
+  enable_clustering: false     # Disable clustering (no FAISS)
+  enable_triage_mode: false    # Disable triage mode
+  enable_monitoring: true      # Enable performance monitoring
 
+# Hardware-specific optimizations
+hardware:
+  # CPU optimizations
+  cpu:
+    use_all_cores: true        # Utilize all CPU cores
+    thread_pool_size: 0        # 0 = auto-detect optimal size
+    numa_aware: true           # NUMA-aware scheduling
+  
+  # GPU optimizations  
+  gpu:
+    enable_multi_gpu: true     # Use multiple GPUs if available
+    memory_fraction: 0.95      # GPU memory fraction to use
+    allow_tf32: true           # Enable TensorFloat-32 for speed
+    mixed_precision: true      # Enable automatic mixed precision
+  
+  # Storage optimizations
+  storage:
+    enable_direct_io: false    # Direct I/O (bypass OS cache)
+    read_ahead_mb: 64          # Read-ahead buffer size
+    parallel_reads: true       # Enable parallel disk reads
+    ssd_optimized: true        # Optimize for SSD storage
+
+# Monitoring and logging
+monitoring:
+  enable_performance_monitor: true
+  sample_interval: 10         # Seconds between metric samples
+  report_interval: 60         # Seconds between performance reports
+  save_metrics: true          # Save metrics to file
+  log_level: "INFO"           # Logging level
+
+# Quality vs Speed trade-offs
+quality:
+  embedding_precision: "mixed"  # "full", "mixed", or "half"
+  index_precision: "high"       # "high", "medium", or "fast"
+  search_quality: "balanced"    # "high", "balanced", or "fast"
+
+# Experimental features (use with caution)
+experimental:
+  enable_streaming_index: true     # Stream index building
+  use_experimental_scanner: true   # Use optimized file scanner
+  enable_worker_auto_scaling: true # Auto-scale workers
+  use_msgpack_serialization: true  # Faster serialization
+
+# System limits and safety
+limits:
+  max_file_size_mb: 500        # Skip files larger than this
+  min_file_size_kb: 1          # Skip files smaller than this
+  max_queue_size: 100000       # Maximum Redis queue size
+  max_memory_per_worker_gb: 8  # Memory limit per worker
+  processing_timeout: 3600     # Overall processing timeout (seconds)
