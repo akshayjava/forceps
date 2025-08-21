@@ -145,6 +145,11 @@ if HAS_EMBEDDINGS:
     try:
         vit_model, clip_model, preprocess_vit, preprocess_clip, vit_dim, clip_dim = load_models()
         COMBINED_DIM = vit_dim + clip_dim
+        
+        # Store CLIP models in session state for sidebar display
+        if clip_model is not None:
+            st.session_state.clip_model = clip_model
+            st.session_state.clip_preprocess = preprocess_clip
     except Exception as e:
         st.error(f"Error loading models: {e}")
         vit_model, clip_model, preprocess_vit, preprocess_clip, vit_dim, clip_dim = None, None, None, None, 0, 0
@@ -1084,7 +1089,6 @@ with search_tab:
         results = []
     
     if run_search:
-        results = [] # Start with an empty list for new search results
         st.session_state.search_distances = {} # Clear old distances
 
         # CLIP-only search (no FAISS)
@@ -1181,12 +1185,14 @@ with search_tab:
         st.write(f"**Search completed:** {len(results)} results found")
         if results:
             st.write(f"**First result:** {results[0]}")
+            st.write(f"**Results stored in session:** {len(st.session_state.last_results)}")
         st.write(f"**Search type:** {'triage' if st.session_state.get('case_type') == 'triage' else 'full'}")
         
         # Debug search state
         st.write(f"**Debug info:**")
         st.write(f"- clip_model: {'✅' if st.session_state.get('clip_model') else '❌'}")
-        st.write(f"- manifest entries: {len(st.session_state.get('manifest', {}))}")
+        manifest = st.session_state.get('manifest') or {}
+        st.write(f"- manifest entries: {len(manifest)}")
         st.write(f"- search results: {len(results)}")
         
         # If no results, show helpful message
@@ -1214,6 +1220,16 @@ with search_tab:
     # Safety check: ensure results is iterable
     if results is None:
         results = []
+    
+    st.write(f"**Filtering {len(results)} results...**")
+    st.write(f"**Filter settings:**")
+    st.write(f"- EXIF filter: {exif_availability}")
+    st.write(f"- Make filter: {selected_make_value}")
+    st.write(f"- Model filter: {selected_model_value}")
+    st.write(f"- Include regex: {include_regex_str if 'include_regex_str' in locals() else 'None'}")
+    st.write(f"- Exclude regex: {exclude_regex_str if 'exclude_regex_str' in locals() else 'None'}")
+    st.write(f"- Time filter: {use_mtime_filter}")
+    st.write(f"- Tag query: {tag_query if 'tag_query' in locals() else 'None'}")
     
     for r in results:
         exif = _exif_for_path(r)
@@ -1250,13 +1266,16 @@ with search_tab:
             if tag_query not in tags:
                 continue
         display_results.append(r)
+    
+    st.write(f"**After filtering: {len(display_results)} results remain**")
 
     # Debug information
     st.markdown("---")
     st.subheader("Debug Info")
     st.write(f"**Case loaded:** {st.session_state.get('selected_case', 'None')}")
     st.write(f"**CLIP model:** {'✅' if st.session_state.get('clip_model') else '❌'}")
-    st.write(f"**Manifest entries:** {len(st.session_state.get('manifest', {}))}")
+    manifest = st.session_state.get('manifest') or {}
+    st.write(f"**Manifest entries:** {len(manifest)}")
     st.write(f"**Search results:** {len(results)}")
     st.write(f"**Display results:** {len(display_results)}")
     
@@ -1270,6 +1289,44 @@ with search_tab:
         st.markdown("---")
         st.subheader("Search Results")
         st.info("🔍 Results from CLIP search (no clustering)")
+        
+        # Display the actual search results
+        search_results = st.session_state.last_results
+        if search_results:
+            st.write(f"**Showing {len(search_results)} search results:**")
+            
+            # Create columns for image display
+            cols = st.columns(5)
+            for i, result_path in enumerate(search_results[:50]):  # Show first 50 results
+                try:
+                    # Get similarity score if available
+                    similarity = st.session_state.get("search_distances", {}).get(result_path, 0)
+                    
+                    # Load and display image
+                    try:
+                        mime, _ = mimetypes.guess_type(result_path)
+                        mime = mime or "image/jpeg"
+                        with open(result_path, "rb") as f:
+                            b64 = base64.b64encode(f.read()).decode("utf-8")
+                        data_url = f"data:{mime};base64,{b64}"
+                    except Exception:
+                        data_url = ""
+                    
+                    # Display in appropriate column
+                    col_idx = i % 5
+                    with cols[col_idx]:
+                        st.markdown(f"<div class='img-card'><img src='{data_url}' /></div>", unsafe_allow_html=True)
+                        caption = Path(result_path).name
+                        if similarity > 0:
+                            caption += f" (sim: {similarity:.3f})"
+                        st.caption(caption)
+                        
+                except Exception as e:
+                    # If image display fails, show filename
+                    col_idx = i % 5
+                    cols[col_idx].write(f"Error: {Path(result_path).name}")
+        else:
+            st.warning("No search results to display")
 
     # ----- Tags page: overview of tags and images -----
     st.markdown("---")
