@@ -277,12 +277,16 @@ def build_index_programmatic_test(config: dict, case_name: str = None):
             # Save PCA matrix data directly since it's not a FAISS index
             # Note: faiss.write_index() only works for FAISS Index objects, not PCA matrices
             # PCA matrices are transformation matrices that need to be saved as data
+            # Convert SWIG objects to Python types for pickling
             pca_data = {
                 'd_in': pca_ret.d_in,
                 'd_out': pca_ret.d_out,
                 'is_trained': pca_ret.is_trained,
-                'eigenvalues': pca_ret.eigenvalues,
-                'PC': pca_ret.PC
+                'eigenvalues': list(pca_ret.eigenvalues) if pca_ret.eigenvalues else None,
+                'PCAMat': list(pca_ret.PCAMat) if pca_ret.PCAMat else None,  # Main transformation matrix
+                'A': list(pca_ret.A) if pca_ret.A else None,  # Alternative transformation matrix
+                'mean': list(pca_ret.mean) if pca_ret.mean else None,  # Mean vector for centering
+                'b': list(pca_ret.b) if pca_ret.b else None  # Bias vector
             }
             with open(case_output_dir / "pca.matrix.pkl", "wb") as f:
                 pickle.dump(pca_data, f)
@@ -292,12 +296,16 @@ def build_index_programmatic_test(config: dict, case_name: str = None):
             # Try alternative approach for different PCA matrix types
             try:
                 # Some PCA matrices might have different attributes
+                # Convert SWIG objects to Python types for pickling
                 pca_data = {
                     'd_in': getattr(pca_ret, 'd_in', None),
                     'd_out': getattr(pca_ret, 'd_out', None),
                     'is_trained': getattr(pca_ret, 'is_trained', None),
-                    'eigenvalues': getattr(pca_ret, 'eigenvalues', None),
-                    'PC': getattr(pca_ret, 'PC', None),
+                    'eigenvalues': list(getattr(pca_ret, 'eigenvalues', [])) if getattr(pca_ret, 'eigenvalues', None) else None,
+                    'PCAMat': list(getattr(pca_ret, 'PCAMat', [])) if getattr(pca_ret, 'PCAMat', None) else None,
+                    'A': list(getattr(pca_ret, 'A', [])) if getattr(pca_ret, 'A', None) else None,
+                    'mean': list(getattr(pca_ret, 'mean', [])) if getattr(pca_ret, 'mean', None) else None,
+                    'b': list(getattr(pca_ret, 'b', [])) if getattr(pca_ret, 'b', None) else None,
                     'matrix_type': str(type(pca_ret))
                 }
                 with open(case_output_dir / "pca.matrix.pkl", "wb") as f:
@@ -328,13 +336,24 @@ def load_pca_matrix(pca_file_path):
             pca_data = pickle.load(f)
         
         # Reconstruct PCA matrix from saved data
-        if pca_data.get('PC') is not None and pca_data.get('d_in') is not None:
+        if pca_data.get('PCAMat') is not None and pca_data.get('d_in') is not None:
             # Create a new PCA matrix with the saved parameters
             pca_matrix = faiss.PCAMatrix(pca_data['d_in'], pca_data['d_out'])
-            pca_matrix.PC = pca_data['PC']
+            
+            # Convert Python lists back to FAISS vectors
+            if pca_data['PCAMat']:
+                pca_matrix.PCAMat = faiss.Float32Vector(pca_data['PCAMat'])
             pca_matrix.is_trained = pca_data.get('is_trained', True)
+            
+            # Set additional attributes if available
             if pca_data.get('eigenvalues') is not None:
-                pca_matrix.eigenvalues = pca_data['eigenvalues']
+                pca_matrix.eigenvalues = faiss.Float32Vector(pca_data['eigenvalues'])
+            if pca_data.get('A') is not None:
+                pca_matrix.A = faiss.Float32Vector(pca_data['A'])
+            if pca_data.get('mean') is not None:
+                pca_matrix.mean = faiss.Float32Vector(pca_data['mean'])
+            if pca_data.get('b') is not None:
+                pca_matrix.b = faiss.Float32Vector(pca_data['b'])
             
             logger.info(f"Successfully loaded PCA matrix from {pca_file_path}")
             return pca_matrix
