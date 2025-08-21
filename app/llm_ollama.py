@@ -53,3 +53,22 @@ def generate_caption_ollama(image_path, model_name="llava"):
         return out or None
     except Exception:
         return None
+
+def general_ollama_query(query_text: str, model_name: str = "llama2") -> str | None:
+    """
+    Performs a general text query to an Ollama LLM.
+    Assumes 'ollama' CLI is installed locally.
+    """
+    if not ollama_installed():
+        return None
+    if not model_available(model_name):
+        return None
+    
+    try:
+        timeout_s = float(os.environ.get("OLLAMA_QUERY_TIMEOUT", 60))
+        cmd = [OLLAMA_CLI, "run", model_name]
+        proc = subprocess.run(cmd, input=query_text.encode("utf-8"), capture_output=True, timeout=timeout_s)
+        out = proc.stdout.decode(errors="ignore").strip()
+        return out or None
+    except Exception:
+        return None
