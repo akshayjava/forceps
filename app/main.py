@@ -57,6 +57,9 @@ from app.utils import (
     read_exif,
     _gather_metadata_for_path,
     hamming_distance,
+    load_bookmarks,
+    save_bookmarks,
+    generate_bookmarks_pdf,
 )
 from app.llm_ollama import ollama_installed, generate_caption_ollama, model_available
 
@@ -300,9 +303,12 @@ if "faiss_partial" not in st.session_state:
     st.session_state.faiss_partial = None  # IndexIDMap2 over IndexFlatL2 for combined embeddings
 if "faiss_clip_partial" not in st.session_state:
     st.session_state.faiss_clip_partial = None  # IndexIDMap2 for CLIP embeddings during indexing
-//
+
 if "last_results" not in st.session_state:
     # Persist last shown results across UI interactions (e.g., bookmarking)
+    st.session_state.last_results = []
+elif st.session_state.last_results is None:
+    # Safety check: ensure last_results is never None
     st.session_state.last_results = []
 if "folder_path" not in st.session_state:
     st.session_state.folder_path = str(Path(__file__).parent / "demo_images")
@@ -345,6 +351,39 @@ if "search_distances" not in st.session_state:
     st.session_state.search_distances = {}
 if "selected_items" not in st.session_state:
     st.session_state.selected_items = set()
+if "bookmarks" not in st.session_state:
+    st.session_state.bookmarks = {}
+if "manifest" not in st.session_state:
+    st.session_state.manifest = {}
+if "cases_dir" not in st.session_state:
+    st.session_state.cases_dir = "output_index"
+if "selected_case" not in st.session_state:
+    st.session_state.selected_case = None
+if "min_index" not in st.session_state:
+    st.session_state.min_index = None
+if "min_paths" not in st.session_state:
+    st.session_state.min_paths = []
+if "phase1_ready" not in st.session_state:
+    st.session_state.phase1_ready = False
+if "phase2_ready" not in st.session_state:
+    st.session_state.phase2_ready = False
+if "index_paths" not in st.session_state:
+    st.session_state.index_paths = []
+if "faiss_combined" not in st.session_state:
+    st.session_state.faiss_combined = None
+if "faiss_clip" not in st.session_state:
+    st.session_state.faiss_clip = None
+if "pca_obj" not in st.session_state:
+    st.session_state.pca_obj = None
+if "cluster_labels" not in st.session_state:
+    st.session_state.cluster_labels = {}
+elif st.session_state.cluster_labels is None:
+    # Safety check: ensure cluster_labels is never None
+    st.session_state.cluster_labels = {}
+if "whoosh_searcher" not in st.session_state:
+    st.session_state.whoosh_searcher = None
+if "embeddings" not in st.session_state:
+    st.session_state.embeddings = {}
 
 # Sidebar: Redis connection settings
 st.sidebar.markdown("### Redis Settings")
@@ -501,7 +540,8 @@ with col_btn:
 folder = st.session_state.folder_path
 start_btn = st.sidebar.button("Start Two-Phase Indexing")
 stop_btn = st.sidebar.button("Cancel Background Tasks")
-//
+save_idx_btn = st.sidebar.button("Save FAISS Indices")
+
 concurrent_phase2 = False
 local_run_phase2 = st.sidebar.checkbox("Run captions after embeddings", value=False, key="local_fast_phase2")
 
@@ -544,7 +584,6 @@ except Exception:
 
 # Bookmarks / Export section
 st.sidebar.markdown("---")
-//
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Interactive Indexing")
@@ -627,7 +666,6 @@ if st.session_state.get("case_type") == "triage" and selected_count > 0:
 
 # Clear bookmarks/tags actions
 st.sidebar.markdown("")
-//
 
 # Filters
 st.sidebar.markdown("---")
@@ -1074,6 +1112,10 @@ with search_tab:
             st.caption(f"Total duration: {st.session_state.total_index_duration:.1f}s")
 
     results = st.session_state.get("last_results", [])
+    # Ensure results is always a list
+    if results is None:
+        results = []
+    
     if run_search:
         results = [] # Start with an empty list for new search results
         st.session_state.search_distances = {} # Clear old distances
@@ -1114,11 +1156,14 @@ with search_tab:
                             if str(hash_value).lower() == str(target_hash).lower():
                                 hash_results_with_dist.append((path, 0))
 
-                # Sort results: exact matches first, then by hamming distance
-                hash_results_with_dist.sort(key=lambda x: x[1])
-                results = [path for path, dist in hash_results_with_dist]
-                st.session_state.search_distances = {path: dist for path, dist in hash_results_with_dist}
+                            # Sort results: exact matches first, then by hamming distance
+            hash_results_with_dist.sort(key=lambda x: x[1])
+            results = [path for path, dist in hash_results_with_dist]
+            st.session_state.search_distances = {path: dist for path, dist in hash_results_with_dist}
         else:
+            # Ensure results is always a list, even if no search was performed
+            if 'results' not in locals() or results is None:
+                results = []
             vector_results = set()
             keyword_results = set()
 
@@ -1158,6 +1203,12 @@ with search_tab:
             results = final_results
 
         st.session_state.last_results = results
+        
+        # Debug search results
+        st.write(f"**Search completed:** {len(results)} results found")
+        if results:
+            st.write(f"**First result:** {results[0]}")
+        st.write(f"**Search type:** {'triage' if st.session_state.get('case_type') == 'triage' else 'full'}")
 
     # Apply EXIF filters to current results for display
     def _exif_for_path(path_str: str):
@@ -1174,6 +1225,10 @@ with search_tab:
             return {}
 
     display_results = []
+    # Safety check: ensure results is iterable
+    if results is None:
+        results = []
+    
     for r in results:
         exif = _exif_for_path(r)
         has_exif = bool(exif)
@@ -1210,6 +1265,17 @@ with search_tab:
                 continue
         display_results.append(r)
 
+    # Debug information
+    st.markdown("---")
+    st.subheader("Debug Info")
+    st.write(f"**Case loaded:** {st.session_state.get('selected_case', 'None')}")
+    st.write(f"**Case type:** {st.session_state.get('case_type', 'None')}")
+    st.write(f"**FAISS combined:** {'✅' if st.session_state.get('faiss_combined') else '❌'}")
+    st.write(f"**FAISS CLIP:** {'✅' if st.session_state.get('faiss_clip') else '❌'}")
+    st.write(f"**Manifest entries:** {len(st.session_state.get('manifest', {}))}")
+    st.write(f"**Search results:** {len(results)}")
+    st.write(f"**Display results:** {len(display_results)}")
+    
     if not results:
         st.info("Type a natural-language query (requires CLIP) or upload an image.")
     elif not display_results:
@@ -1309,7 +1375,7 @@ with search_tab:
             # --- Selection Checkbox ---
             is_selected = r in st.session_state.get("selected_items", set())
             # The checkbox state determines if the item should be in the set.
-            if tile_container.checkbox("Select for full index", value=is_selected, key=f"select_{r}"):
+            if tile_container.checkbox("Select for full index", value=is_selected, key=f"select_top_{r}"):
                 if not is_selected:
                     st.session_state.selected_items.add(r)
                     st.rerun()
@@ -1352,7 +1418,7 @@ with search_tab:
             with tile_container.expander("Manage Bookmark"):
                 is_bookmarked = _is_bm(r)
 
-                if st.checkbox("Bookmarked", value=is_bookmarked, key=f"bm_check_{r}"):
+                if st.checkbox("Bookmarked", value=is_bookmarked, key=f"bm_check_top_{r}"):
                     if not is_bookmarked:
                         st.session_state.bookmarks[r] = st.session_state.bookmarks.get(r, {"tags": [], "notes": "", "added_ts": time.time()})
                         _save_bms()
@@ -1361,12 +1427,12 @@ with search_tab:
                     bookmark_data = st.session_state.bookmarks.get(r, {})
 
                     existing_tags = "\n".join(bookmark_data.get("tags", []))
-                    new_tags_str = st.text_area("Tags (one per line)", value=existing_tags, key=f"tags_{r}")
+                    new_tags_str = st.text_area("Tags (one per line)", value=existing_tags, key=f"tags_top_{r}")
 
                     existing_notes = bookmark_data.get("notes", "")
-                    new_notes = st.text_area("Notes", value=existing_notes, key=f"notes_{r}")
+                    new_notes = st.text_area("Notes", value=existing_notes, key=f"notes_top_{r}")
 
-                    if st.button("Save Bookmark Details", key=f"save_bm_{r}"):
+                    if st.button("Save Bookmark Details", key=f"save_bm_top_{r}"):
                         st.session_state.bookmarks[r]['tags'] = [t.strip() for t in new_tags_str.split("\n") if t.strip()]
                         st.session_state.bookmarks[r]['notes'] = new_notes
                         _save_bms()
@@ -1385,7 +1451,7 @@ with search_tab:
         st.markdown("### Top results")
 
         # If results have been clustered, group them
-        if 'cluster_labels' in st.session_state:
+        if 'cluster_labels' in st.session_state and st.session_state.cluster_labels is not None:
             clusters = {}
             for path in display_results:
                 label = st.session_state.cluster_labels.get(path)
@@ -1440,14 +1506,18 @@ with reporting_tab:
                 )
 def reset_case_state():
     """Clears all session state related to a loaded case."""
-    keys_to_reset = [
-        "faiss_combined", "faiss_clip", "pca_obj", "manifest", "index_paths",
-        "whoosh_searcher", "embeddings", "bookmarks", "case_type", "last_results",
-        "cluster_labels"
-    ]
-    for key in keys_to_reset:
+    # Reset complex objects to None
+    complex_keys = ["faiss_combined", "faiss_clip", "pca_obj", "manifest", "index_paths",
+                   "whoosh_searcher", "embeddings", "case_type", "last_results"]
+    for key in complex_keys:
         if key in st.session_state:
             st.session_state[key] = None
+    
+    # Reset collections to empty containers
+    if "bookmarks" in st.session_state:
+        st.session_state.bookmarks = {}
+    if "cluster_labels" in st.session_state:
+        st.session_state.cluster_labels = {}
 
 cases_dir_path = st.sidebar.text_input("Cases Directory", value="output_index")
 st.session_state.cases_dir = cases_dir_path
@@ -1689,94 +1759,15 @@ if st.session_state.get("last_results") and st.session_state.get("embeddings") i
             else:
                 st.warning("No results to cluster.")
 
-//
 
-def display_image_tile(tile_container, image_path):
-    """Renders a single image tile with all its controls."""
-    r = image_path
-    try:
-        # --- Image Display ---
-        encoded = urllib.parse.quote(r)
-        try:
-            mime, _ = mimetypes.guess_type(r)
-            mime = mime or "image/jpeg"
-            with open(r, "rb") as _f:
-                b64 = base64.b64encode(_f.read()).decode("utf-8")
-            data_url = f"data:{mime};base64,{b64}"
-        except Exception:
-            data_url = ""
-        tile_container.markdown(f"<div class='img-card'><img src='{data_url}' /></div>", unsafe_allow_html=True)
-        tile_container.caption(Path(r).name)
-
-        # --- Details Expander ---
-        if 'manifest' in st.session_state and r in st.session_state.manifest:
-            with tile_container.expander("Show Details"):
-                manifest_item = st.session_state.manifest[r]
-                cached_meta = load_cache(fingerprint(Path(r))) or {}
-
-                st.code(manifest_item['path'], language='text')
-
-                st.markdown("**Hashes**")
-                hashes = manifest_item.get('hashes', {})
-                if hashes:
-                    for hash_name, hash_value in hashes.items():
-                        st.text(f"{hash_name.upper()}: {hash_value}")
-
-                st.markdown("**EXIF Data**")
-                exif_data = cached_meta.get("metadata", {}).get("exif", {})
-                if exif_data:
-                    for key, value in exif_data.items():
-                        st.text(f"{key}: {value}")
-
-                st.markdown("**AI Caption**")
-                caption = cached_meta.get("metadata", {}).get("caption")
-                st.text(caption or "Not available.")
-
-        # --- Bookmark/Tags Expander ---
-        def _is_bm(pth: str) -> bool:
-            return pth in (st.session_state.get("bookmarks", {}) or {})
-
-        def _save_bms():
-            case_dir = Path(st.session_state.cases_dir) / st.session_state.selected_case
-            save_bookmarks(st.session_state.bookmarks, case_dir)
-
-        with tile_container.expander("Manage Bookmark"):
-            is_bookmarked = _is_bm(r)
-
-            if st.checkbox("Bookmarked", value=is_bookmarked, key=f"bm_check_{r}"):
-                if not is_bookmarked:
-                    st.session_state.bookmarks[r] = st.session_state.bookmarks.get(r, {"tags": [], "notes": "", "added_ts": time.time()})
-                    _save_bms()
-                    st.rerun()
-
-                bookmark_data = st.session_state.bookmarks.get(r, {})
-
-                existing_tags = "\n".join(bookmark_data.get("tags", []))
-                new_tags_str = st.text_area("Tags (one per line)", value=existing_tags, key=f"tags_{r}")
-
-                existing_notes = bookmark_data.get("notes", "")
-                new_notes = st.text_area("Notes", value=existing_notes, key=f"notes_{r}")
-
-                if st.button("Save Bookmark Details", key=f"save_bm_{r}"):
-                    st.session_state.bookmarks[r]['tags'] = [t.strip() for t in new_tags_str.split("\n") if t.strip()]
-                    st.session_state.bookmarks[r]['notes'] = new_notes
-                    _save_bms()
-                    st.success("Bookmark updated!")
-
-            elif is_bookmarked:
-                st.session_state.bookmarks.pop(r, None)
-                _save_bms()
-                st.rerun()
-    except Exception as e:
-        tile_container.error(f"Error: {e}")
-        tile_container.write(Path(r).name)
+# Duplicate function removed - using the first definition above
 
 
 if display_results:
     st.markdown("### Top results")
 
     # If results have been clustered, group them
-    if 'cluster_labels' in st.session_state:
+    if 'cluster_labels' in st.session_state and st.session_state.cluster_labels is not None:
         clusters = {}
         for path in display_results:
             label = st.session_state.cluster_labels.get(path)
@@ -1785,9 +1776,10 @@ if display_results:
                     clusters[label] = []
                 clusters[label].append(path)
 
-            if st.button("Clear Clustering", key="clear_cluster_bottom"):
-                del st.session_state['cluster_labels']
-                st.rerun()
+        # Clear clustering button (moved outside the loop)
+        if st.button("Clear Clustering", key="clear_cluster_bottom"):
+            del st.session_state['cluster_labels']
+            st.rerun()
 
         for label, paths in sorted(clusters.items()):
             st.markdown(f"--- \n#### Cluster {label+1} ({len(paths)} images)")
