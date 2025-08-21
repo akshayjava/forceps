@@ -72,6 +72,7 @@ def enqueue_jobs_programmatic_test(input_dir: str, config: dict):
     image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}
     image_data = []
     
+    # Memory-efficient file processing with generator
     def process_single_file(file_path, hashers_list):
         try:
             all_hashes = {}
@@ -84,18 +85,30 @@ def enqueue_jobs_programmatic_test(input_dir: str, config: dict):
 
     with ThreadPoolExecutor(max_workers=cfg_perf['scan_max_workers']) as executor:
         futures = []
+        file_count = 0
+        
+        # First pass: collect all image files
         for root, _, files in os.walk(input_dir):
             for filename in files:
                 if Path(filename).suffix.lower() in image_extensions:
                     file_path = Path(root) / filename
                     futures.append(executor.submit(process_single_file, file_path, hashers))
+                    file_count += 1
+                    
+                    # Process in batches to avoid memory issues
+                    if len(futures) >= 1000:  # Process in batches of 1000
+                        for future in as_completed(futures):
+                            result = future.result()
+                            if result:
+                                image_data.append(result)
+                        futures = []  # Clear processed futures
+                        logger.info(f"Processed batch of 1000 files. Total processed: {len(image_data)}")
 
-        for i, future in enumerate(as_completed(futures)):
+        # Process remaining futures
+        for future in as_completed(futures):
             result = future.result()
             if result:
                 image_data.append(result)
-            if (i + 1) % 100 == 0:
-                logger.info(f"Scanned and processed {i + 1} files...")
 
     logger.info(f"Found and processed {len(image_data)} total images.")
 
@@ -107,12 +120,18 @@ def enqueue_jobs_programmatic_test(input_dir: str, config: dict):
         logger.warning(f"Failed to set Redis counters: {e}")
 
     jobs_enqueued = 0
+    # Use pipeline for more efficient Redis operations
+    pipeline = r.pipeline()
+    
     for i in range(0, len(image_data), cfg_perf['job_batch_size']):
         batch = image_data[i:i + cfg_perf['job_batch_size']]
-        r.rpush(cfg_redis['job_queue'], json.dumps(batch))
+        pipeline.rpush(cfg_redis['job_queue'], json.dumps(batch))
         jobs_enqueued += 1
-
-    logger.info(f"Enqueued {jobs_enqueued} jobs with a total of {len(image_data)} images to queue '{cfg_redis['job_queue']}'.")
+    
+    # Execute all Redis operations in a single pipeline
+    pipeline.execute()
+    
+    logger.info(f"Enqueued {jobs_enqueued} jobs with a total of {len(image_data)} images to queue '{cfg_redis['job_queue']}' using pipeline.")
     return len(image_data)
 
 def build_index_programmatic_test(config: dict, case_name: str = None):
@@ -135,15 +154,22 @@ def build_index_programmatic_test(config: dict, case_name: str = None):
         return None, []
 
     all_results = []
+    # Use pipeline for more efficient Redis operations
+    pipeline = r.pipeline()
+    
     while True:
-        items = r.lrange(cfg_redis['results_queue'], 0, 99)
+        items = r.lrange(cfg_redis['results_queue'], 0, 199)  # Larger batch size
         if not items:
             break
-        r.ltrim(cfg_redis['results_queue'], len(items), -1) # Remove consumed items
+        
+        # Use pipeline for atomic trim operation
+        pipeline.ltrim(cfg_redis['results_queue'], len(items), -1)
+        pipeline.execute()
+        
         for item in items:
             all_results.extend(json.loads(item))
         logger.info(f"Consumed {len(items)} results. Total embeddings so far: {len(all_results)}")
-        time.sleep(0.01) # Small sleep to yield CPU
+        time.sleep(0.005)  # Reduced sleep for better performance
 
     if not all_results:
         logger.warning("No embeddings were found in the results queue. Index not built.")
@@ -563,39 +589,51 @@ def main():
         logger.warning("No images found. Skipping further steps.")
         sys.exit(0)
 
-    # Phase 2: Embedding Computation (Worker)
-    worker_id = str(uuid.uuid4())
-    worker_process = None
+    # Phase 2: Embedding Computation (Multiple Workers)
     start_time = time.time()
+    worker_processes = []
+    max_workers = config['performance']['worker']['max_workers']
+    
     try:
-        logger.info(f"Starting worker process with ID: {worker_id}")
-        # Construct the command to run the worker script
-        worker_cmd = [
-            sys.executable, # Use the same python interpreter
-            os.path.join(os.path.abspath('./app'), 'optimized_worker.py'),
-            "--worker_id", worker_id,
-            "--config", "app/config.yaml" # Pass the config path
-        ]
-        # Set PYTHONPATH for the subprocess
-        worker_env = os.environ.copy()
-        if 'PYTHONPATH' in worker_env:
-            worker_env['PYTHONPATH'] = os.path.abspath('.') + os.pathsep + worker_env['PYTHONPATH']
-        else:
-            worker_env['PYTHONPATH'] = os.path.abspath('.')
+        logger.info(f"Starting {max_workers} worker processes for parallel processing...")
+        
+        # Start multiple worker processes
+        for i in range(max_workers):
+            worker_id = str(uuid.uuid4())
+            worker_cmd = [
+                sys.executable,
+                os.path.join(os.path.abspath('./app'), 'optimized_worker.py'),
+                "--worker_id", worker_id,
+                "--config", "app/config.yaml"
+            ]
+            
+            worker_env = os.environ.copy()
+            if 'PYTHONPATH' in worker_env:
+                worker_env['PYTHONPATH'] = os.path.abspath('.') + os.pathsep + worker_env['PYTHONPATH']
+            else:
+                worker_env['PYTHONPATH'] = os.path.abspath('.')
+            
+            # Start worker process
+            worker_process = subprocess.Popen(
+                worker_cmd, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE, 
+                text=True, 
+                cwd=os.getcwd(), 
+                env=worker_env
+            )
+            worker_processes.append(worker_process)
+            logger.info(f"Worker {i+1}/{max_workers} started with PID: {worker_process.pid}")
 
-        # Start the worker as a subprocess
-        worker_process = subprocess.Popen(worker_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=os.getcwd(), env=worker_env)
-        logger.info(f"Worker process started with PID: {worker_process.pid}")
-
-        # Monitor Redis for completion
+        # Monitor Redis for completion with all workers
         total_embeddings_expected = int(r.get("forceps:stats:total_images") or 0)
         
         if total_embeddings_expected == 0:
-            logger.warning("No embeddings expected. Worker might not have jobs to process.")
+            logger.warning("No embeddings expected. Workers might not have jobs to process.")
 
         # Progress tracking for large datasets
         last_progress_time = time.time()
-        progress_interval = 10 if total_embeddings_expected > 100 else 5  # More frequent updates for large datasets
+        progress_interval = 5  # More frequent updates for better monitoring
 
         while True:
             embeddings_done = int(r.get("forceps:stats:embeddings_done") or 0)
@@ -604,41 +642,48 @@ def main():
             current_time = time.time()
             if current_time - last_progress_time >= progress_interval:
                 progress_percent = (embeddings_done / total_embeddings_expected * 100) if total_embeddings_expected > 0 else 0
-                logger.info(f"Progress: {embeddings_done}/{total_embeddings_expected} ({progress_percent:.1f}%) - Jobs remaining: {jobs_remaining}")
+                active_workers = sum(1 for p in worker_processes if p.poll() is None)
+                logger.info(f"Progress: {embeddings_done}/{total_embeddings_expected} ({progress_percent:.1f}%) - Jobs remaining: {jobs_remaining} - Active workers: {active_workers}")
                 last_progress_time = current_time
             
             # Check for completion: all embeddings processed AND job queue is empty
             if embeddings_done >= total_embeddings_expected and jobs_remaining == 0:
-                logger.info("All embeddings processed and jobs queue is empty. Terminating worker.")
+                logger.info("All embeddings processed and jobs queue is empty. Terminating workers.")
                 break
             
-            # Check if worker process is still alive
-            if worker_process.poll() is not None:
-                logger.error(f"Worker process unexpectedly exited with code {worker_process.returncode}")
-                stdout, stderr = worker_process.communicate()
-                logger.error(f"Worker stdout:\n{stdout}")
-                logger.error(f"Worker stderr:\n{stderr}")
-                break # Exit loop if worker crashed
+            # Check if any worker process has crashed
+            crashed_workers = [i for i, p in enumerate(worker_processes) if p.poll() is not None]
+            if crashed_workers:
+                for i in crashed_workers:
+                    worker_process = worker_processes[i]
+                    logger.error(f"Worker {i+1} unexpectedly exited with code {worker_process.returncode}")
+                    stdout, stderr = worker_process.communicate()
+                    logger.error(f"Worker {i+1} stdout:\n{stdout}")
+                    logger.error(f"Worker {i+1} stderr:\n{stderr}")
+                # Continue with remaining workers
 
-            time.sleep(2) # Poll more frequently for large datasets
+            time.sleep(1)  # Poll more frequently for better responsiveness
 
     finally:
-        if worker_process and worker_process.poll() is None:
-            logger.info(f"Sending SIGTERM to worker process {worker_process.pid}")
-            worker_process.terminate()
-            try:
-                worker_process.wait(timeout=10) # Give it some time to terminate
-            except subprocess.TimeoutExpired:
-                logger.warning(f"Worker process {worker_process.pid} did not terminate gracefully. Sending SIGKILL.")
-                worker_process.kill()
+        # Terminate all worker processes
+        for i, worker_process in enumerate(worker_processes):
+            if worker_process.poll() is None:
+                logger.info(f"Sending SIGTERM to worker {i+1} (PID: {worker_process.pid})")
+                worker_process.terminate()
+                try:
+                    worker_process.wait(timeout=5)  # Shorter timeout for faster cleanup
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"Worker {i+1} (PID: {worker_process.pid}) did not terminate gracefully. Sending SIGKILL.")
+                    worker_process.kill()
         
         end_time = time.time()
         time_worker = end_time - start_time
         embeddings_processed = int(r.get("forceps:stats:embeddings_done") or 0)
         logger.info(f"Phase 2 (Embedding Computation) completed in {time_worker:.2f} seconds.")
-        logger.info(f"Embeddings processed by worker: {embeddings_processed}")
+        logger.info(f"Embeddings processed by {max_workers} workers: {embeddings_processed}")
         if time_worker > 0:
             logger.info(f"Worker throughput: {embeddings_processed / time_worker:.2f} images/second.")
+            logger.info(f"Per-worker throughput: {embeddings_processed / time_worker / max_workers:.2f} images/second/worker")
 
     # Phase 3: Index Building
     start_time = time.time()

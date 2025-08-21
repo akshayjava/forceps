@@ -17,11 +17,11 @@ models:
 
 performance:
   worker:
-    batch_size: 32
-    max_workers: 8
+    batch_size: 64  # Increased batch size for better GPU utilization
+    max_workers: 16  # More parallel workers
   enqueuer:
-    job_batch_size: 512
-    scan_max_workers: 16
+    job_batch_size: 1024  # Larger job batches for better throughput
+    scan_max_workers: 32  # More parallel scanning
   faiss:
     use_pca: true
     pca_dim: 384
