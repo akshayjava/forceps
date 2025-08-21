@@ -274,26 +274,38 @@ def build_index_programmatic_test(config: dict, case_name: str = None):
         faiss.write_index(index_clip, str(case_output_dir / "clip.index"))
     if pca_ret:
         try:
-            # Save PCA matrix using FAISS's built-in save method instead of pickle
-            pca_path = case_output_dir / "pca.matrix.faiss"
-            faiss.write_index(pca_ret, str(pca_path))
-            logger.info(f"Saved PCA matrix to {pca_path}")
+            # Save PCA matrix data directly since it's not a FAISS index
+            # Note: faiss.write_index() only works for FAISS Index objects, not PCA matrices
+            # PCA matrices are transformation matrices that need to be saved as data
+            pca_data = {
+                'd_in': pca_ret.d_in,
+                'd_out': pca_ret.d_out,
+                'is_trained': pca_ret.is_trained,
+                'eigenvalues': pca_ret.eigenvalues,
+                'PC': pca_ret.PC
+            }
+            with open(case_output_dir / "pca.matrix.pkl", "wb") as f:
+                pickle.dump(pca_data, f)
+            logger.info("Saved PCA matrix data successfully")
         except Exception as e:
-            logger.warning(f"Failed to save PCA matrix: {e}")
-            # Fallback: try to save just the transformation matrix
+            logger.warning(f"Failed to save PCA matrix data: {e}")
+            # Try alternative approach for different PCA matrix types
             try:
+                # Some PCA matrices might have different attributes
                 pca_data = {
-                    'd_in': pca_ret.d_in,
-                    'd_out': pca_ret.d_out,
-                    'is_trained': pca_ret.is_trained,
-                    'eigenvalues': pca_ret.eigenvalues,
-                    'PC': pca_ret.PC
+                    'd_in': getattr(pca_ret, 'd_in', None),
+                    'd_out': getattr(pca_ret, 'd_out', None),
+                    'is_trained': getattr(pca_ret, 'is_trained', None),
+                    'eigenvalues': getattr(pca_ret, 'eigenvalues', None),
+                    'PC': getattr(pca_ret, 'PC', None),
+                    'matrix_type': str(type(pca_ret))
                 }
                 with open(case_output_dir / "pca.matrix.pkl", "wb") as f:
                     pickle.dump(pca_data, f)
-                logger.info("Saved PCA matrix data as fallback")
+                logger.info("Saved PCA matrix data with fallback attributes")
             except Exception as e2:
-                logger.warning(f"Failed to save PCA matrix data: {e2}")
+                logger.warning(f"Failed to save PCA matrix data with fallback: {e2}")
+                logger.info("PCA matrix will not be saved - index will work without it")
     
     image_paths_only = [item['path'] for item in manifest_data]
     with open(case_output_dir / "image_paths.pkl", "wb") as f:
@@ -308,6 +320,31 @@ def build_index_programmatic_test(config: dict, case_name: str = None):
 
     logger.info(f"Index building complete for case '{case_name}'. Saved to {case_output_dir}")
     return case_output_dir, image_paths_only
+
+def load_pca_matrix(pca_file_path):
+    """Load a saved PCA matrix from file."""
+    try:
+        with open(pca_file_path, 'rb') as f:
+            pca_data = pickle.load(f)
+        
+        # Reconstruct PCA matrix from saved data
+        if pca_data.get('PC') is not None and pca_data.get('d_in') is not None:
+            # Create a new PCA matrix with the saved parameters
+            pca_matrix = faiss.PCAMatrix(pca_data['d_in'], pca_data['d_out'])
+            pca_matrix.PC = pca_data['PC']
+            pca_matrix.is_trained = pca_data.get('is_trained', True)
+            if pca_data.get('eigenvalues') is not None:
+                pca_matrix.eigenvalues = pca_data['eigenvalues']
+            
+            logger.info(f"Successfully loaded PCA matrix from {pca_file_path}")
+            return pca_matrix
+        else:
+            logger.warning(f"PCA matrix data incomplete in {pca_file_path}")
+            return None
+            
+    except Exception as e:
+        logger.warning(f"Failed to load PCA matrix from {pca_file_path}: {e}")
+        return None
 
 # Caption generation removed to reduce cost and complexity
 
